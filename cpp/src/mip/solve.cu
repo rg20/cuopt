@@ -226,23 +226,9 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
                             sol.get_termination_status() == mip_termination_status_t::Infeasible;
       auto primal_solution =
         cuopt::device_copy(sol.get_solution(), op_problem.get_handle_ptr()->get_stream());
-      rmm::device_uvector<f_t> dual_solution(0, op_problem.get_handle_ptr()->get_stream());
-      rmm::device_uvector<f_t> reduced_costs(0, op_problem.get_handle_ptr()->get_stream());
-      presolver->undo(primal_solution,
-                      dual_solution,
-                      reduced_costs,
-                      cuopt::linear_programming::problem_category_t::MIP,
-                      status_to_skip,
-                      op_problem.get_handle_ptr()->get_stream());
+      presolver->undo_mip(
+        primal_solution, status_to_skip, op_problem.get_handle_ptr()->get_stream());
       if (!status_to_skip) {
-        thrust::fill(rmm::exec_policy(op_problem.get_handle_ptr()->get_stream()),
-                     dual_solution.data(),
-                     dual_solution.data() + dual_solution.size(),
-                     std::numeric_limits<f_t>::signaling_NaN());
-        thrust::fill(rmm::exec_policy(op_problem.get_handle_ptr()->get_stream()),
-                     reduced_costs.data(),
-                     reduced_costs.data() + reduced_costs.size(),
-                     std::numeric_limits<f_t>::signaling_NaN());
         detail::problem_t<i_t, f_t> full_problem(op_problem);
         detail::solution_t<i_t, f_t> full_sol(full_problem);
         full_sol.copy_new_assignment(cuopt::host_copy(primal_solution));

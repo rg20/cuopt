@@ -357,24 +357,134 @@ std::pair<optimization_problem_t<i_t, f_t>, bool> third_party_presolve_t<i_t, f_
     build_optimization_problem<i_t, f_t>(papilo_problem, op_problem.get_handle_ptr()), true);
 }
 
+papilo::VarBasisStatus cuopt_to_papilo_var_basis_status(cuopt_variable_status_t status)
+{
+  switch (status) {
+    case cuopt_variable_status_t::BASIC: return papilo::VarBasisStatus::BASIC;
+    case cuopt_variable_status_t::NONBASIC_LOWER: return papilo::VarBasisStatus::ON_LOWER;
+    case cuopt_variable_status_t::NONBASIC_UPPER: return papilo::VarBasisStatus::ON_UPPER;
+    case cuopt_variable_status_t::NONBASIC_FREE:
+      return papilo::VarBasisStatus::UNDEFINED;  // FIXME: Is this correct?
+    case cuopt_variable_status_t::NONBASIC_FIXED: return papilo::VarBasisStatus::FIXED;
+    case cuopt_variable_status_t::SUPERBASIC:
+      return papilo::VarBasisStatus::UNDEFINED;  // FIXME: Is this correct?
+  }
+  return papilo::VarBasisStatus::UNDEFINED;
+}
+
+cuopt_variable_status_t papilo_to_cuopt_var_basis_status(papilo::VarBasisStatus status)
+{
+  switch (status) {
+    case papilo::VarBasisStatus::BASIC: return cuopt_variable_status_t::BASIC;
+    case papilo::VarBasisStatus::ON_LOWER: return cuopt_variable_status_t::NONBASIC_LOWER;
+    case papilo::VarBasisStatus::ON_UPPER: return cuopt_variable_status_t::NONBASIC_UPPER;
+    case papilo::VarBasisStatus::FIXED: return cuopt_variable_status_t::NONBASIC_FIXED;
+    case papilo::VarBasisStatus::UNDEFINED:
+      return cuopt_variable_status_t::SUPERBASIC;  // FIXME: Is this correct?
+    case papilo::VarBasisStatus::ZERO:
+      return cuopt_variable_status_t::NONBASIC_FREE;  // FIXME: Is this correct?
+  }
+  return cuopt_variable_status_t::BASIC;
+}
+
 template <typename i_t, typename f_t>
-void third_party_presolve_t<i_t, f_t>::undo(rmm::device_uvector<f_t>& primal_solution,
-                                            rmm::device_uvector<f_t>& dual_solution,
-                                            rmm::device_uvector<f_t>& reduced_costs,
-                                            problem_category_t category,
-                                            bool status_to_skip,
-                                            rmm::cuda_stream_view stream_view)
+void third_party_presolve_t<i_t, f_t>::undo_lp(
+  rmm::device_uvector<f_t>& primal_solution,
+  rmm::device_uvector<f_t>& dual_solution,
+  rmm::device_uvector<f_t>& reduced_costs,
+  rmm::device_uvector<f_t>& slack,
+  const bool basis_available,
+  rmm::device_uvector<cuopt_variable_status_t>& vstatus,
+  rmm::device_uvector<cuopt_variable_status_t>& row_status,
+  bool status_to_skip,
+  rmm::cuda_stream_view stream_view)
 {
   --presolve_calls_;
   cuopt_expects(
     presolve_calls_ == 0, error_type_t::ValidationError, "Postsolve can only be called once");
   if (status_to_skip) { return; }
+
   std::vector<f_t> primal_sol_vec_h(primal_solution.size());
-  raft::copy(primal_sol_vec_h.data(), primal_solution.data(), primal_solution.size(), stream_view);
   std::vector<f_t> dual_sol_vec_h(dual_solution.size());
-  raft::copy(dual_sol_vec_h.data(), dual_solution.data(), dual_solution.size(), stream_view);
   std::vector<f_t> reduced_costs_vec_h(reduced_costs.size());
+  std::vector<f_t> slack_vec_h(slack.size());
+  std::vector<cuopt_variable_status_t> vstatus_vec_h(vstatus.size());
+  std::vector<cuopt_variable_status_t> row_status_vec_h(row_status.size());
+
+  raft::copy(primal_sol_vec_h.data(), primal_solution.data(), primal_solution.size(), stream_view);
+  raft::copy(dual_sol_vec_h.data(), dual_solution.data(), dual_solution.size(), stream_view);
   raft::copy(reduced_costs_vec_h.data(), reduced_costs.data(), reduced_costs.size(), stream_view);
+  raft::copy(slack_vec_h.data(), slack.data(), slack.size(), stream_view);
+  raft::copy(vstatus_vec_h.data(), vstatus.data(), vstatus.size(), stream_view);
+  raft::copy(row_status_vec_h.data(), row_status.data(), row_status.size(), stream_view);
+
+  std::vector<papilo::VarBasisStatus> var_basis_status(vstatus_vec_h.size());
+  std::vector<papilo::VarBasisStatus> row_basis_status(row_status_vec_h.size());
+  for (size_t i = 0; i < vstatus_vec_h.size(); i++) {
+    var_basis_status[i] = cuopt_to_papilo_var_basis_status(vstatus_vec_h[i]);
+  }
+  for (size_t i = 0; i < row_status_vec_h.size(); i++) {
+    row_basis_status[i] = cuopt_to_papilo_var_basis_status(row_status_vec_h[i]);
+  }
+
+  papilo::Solution<f_t> reduced_sol;
+  reduced_sol.primal         = primal_sol_vec_h;
+  reduced_sol.dual           = dual_sol_vec_h;
+  reduced_sol.reducedCosts   = reduced_costs_vec_h;
+  reduced_sol.slack          = slack_vec_h;
+  reduced_sol.basisAvailabe  = basis_available;
+  reduced_sol.varBasisStatus = var_basis_status;
+  reduced_sol.rowBasisStatus = row_basis_status;
+
+  papilo::Solution<f_t> full_sol;
+
+  papilo::Message Msg{};
+  Msg.setVerbosityLevel(papilo::VerbosityLevel::kQuiet);
+  papilo::Postsolve<f_t> post_solver{Msg, post_solve_storage_.getNum()};
+
+  bool is_optimal = false;
+  auto status     = post_solver.undo(reduced_sol, full_sol, post_solve_storage_, is_optimal);
+  check_postsolve_status(status);
+
+  primal_solution.resize(full_sol.primal.size(), stream_view);
+  dual_solution.resize(full_sol.dual.size(), stream_view);
+  reduced_costs.resize(full_sol.reducedCosts.size(), stream_view);
+  slack.resize(full_sol.slack.size(), stream_view);
+
+  std::vector<cuopt_variable_status_t> vstatus_vec(full_sol.varBasisStatus.size());
+  std::vector<cuopt_variable_status_t> row_status_vec(full_sol.rowBasisStatus.size());
+  for (size_t i = 0; i < full_sol.varBasisStatus.size(); i++) {
+    vstatus_vec[i] = papilo_to_cuopt_var_basis_status(full_sol.varBasisStatus[i]);
+  }
+  for (size_t i = 0; i < full_sol.rowBasisStatus.size(); i++) {
+    row_status_vec[i] = papilo_to_cuopt_var_basis_status(full_sol.rowBasisStatus[i]);
+  }
+  vstatus.resize(vstatus_vec.size(), stream_view);
+  row_status.resize(row_status_vec.size(), stream_view);
+
+  slack.resize(full_sol.slack.size(), stream_view);
+  raft::copy(primal_solution.data(), full_sol.primal.data(), full_sol.primal.size(), stream_view);
+  raft::copy(dual_solution.data(), full_sol.dual.data(), full_sol.dual.size(), stream_view);
+  raft::copy(
+    reduced_costs.data(), full_sol.reducedCosts.data(), full_sol.reducedCosts.size(), stream_view);
+  raft::copy(slack.data(), full_sol.slack.data(), full_sol.slack.size(), stream_view);
+  raft::copy(vstatus.data(), vstatus_vec.data(), vstatus_vec.size(), stream_view);
+  raft::copy(row_status.data(), row_status_vec.data(), row_status_vec.size(), stream_view);
+}
+
+template <typename i_t, typename f_t>
+void third_party_presolve_t<i_t, f_t>::undo_mip(rmm::device_uvector<f_t>& primal_solution,
+                                                bool status_to_skip,
+                                                rmm::cuda_stream_view stream_view)
+{
+  --presolve_calls_;
+  cuopt_expects(
+    presolve_calls_ == 0, error_type_t::ValidationError, "Postsolve can only be called once");
+  if (status_to_skip) { return; }
+
+  std::vector<f_t> primal_sol_vec_h(primal_solution.size());
+
+  raft::copy(primal_sol_vec_h.data(), primal_solution.data(), primal_solution.size(), stream_view);
 
   papilo::Solution<f_t> reduced_sol(primal_sol_vec_h);
   papilo::Solution<f_t> full_sol;
@@ -388,8 +498,6 @@ void third_party_presolve_t<i_t, f_t>::undo(rmm::device_uvector<f_t>& primal_sol
   check_postsolve_status(status);
 
   primal_solution.resize(full_sol.primal.size(), stream_view);
-  dual_solution.resize(full_sol.primal.size(), stream_view);
-  reduced_costs.resize(full_sol.primal.size(), stream_view);
   raft::copy(primal_solution.data(), full_sol.primal.data(), full_sol.primal.size(), stream_view);
 }
 

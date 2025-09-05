@@ -641,14 +641,26 @@ optimization_problem_solution_t<i_t, f_t> solve_lp(optimization_problem_t<i_t, f
         cuopt::device_copy(solution.get_dual_solution(), op_problem.get_handle_ptr()->get_stream());
       auto reduced_costs =
         cuopt::device_copy(solution.get_reduced_cost(), op_problem.get_handle_ptr()->get_stream());
-      bool status_to_skip = false;
 
-      presolver->undo(primal_solution,
-                      dual_solution,
-                      reduced_costs,
-                      cuopt::linear_programming::problem_category_t::LP,
-                      status_to_skip,
-                      op_problem.get_handle_ptr()->get_stream());
+      using cuopt_variable_status_t = cuopt::linear_programming::dual_simplex::variable_status_t;
+
+      rmm::device_uvector<f_t> slack(0, op_problem.get_handle_ptr()->get_stream());
+      rmm::device_uvector<cuopt_variable_status_t> vstatus(
+        0, op_problem.get_handle_ptr()->get_stream());
+      rmm::device_uvector<cuopt_variable_status_t> row_status(
+        0, op_problem.get_handle_ptr()->get_stream());
+
+      bool status_to_skip  = false;
+      bool basis_available = false;
+      presolver->undo_lp(primal_solution,
+                         dual_solution,
+                         reduced_costs,
+                         slack,
+                         basis_available,
+                         vstatus,
+                         row_status,
+                         status_to_skip,
+                         op_problem.get_handle_ptr()->get_stream());
 
       thrust::fill(rmm::exec_policy(op_problem.get_handle_ptr()->get_stream()),
                    dual_solution.data(),

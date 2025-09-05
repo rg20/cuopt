@@ -18,9 +18,11 @@
 #pragma once
 
 #include <cuopt/linear_programming/optimization_problem.hpp>
+#include <dual_simplex/initial_basis.hpp>
 
 namespace cuopt::linear_programming::detail {
 
+using cuopt_variable_status_t = cuopt::linear_programming::dual_simplex::variable_status_t;
 template <typename i_t, typename f_t>
 class third_party_presolve_t {
  public:
@@ -33,12 +35,19 @@ class third_party_presolve_t {
     f_t relative_tolerance,
     double time_limit);
 
-  void undo(rmm::device_uvector<f_t>& primal_solution,
-            rmm::device_uvector<f_t>& dual_solution,
-            rmm::device_uvector<f_t>& reduced_costs,
-            problem_category_t category,
-            bool status_to_skip,
-            rmm::cuda_stream_view stream_view);
+  void undo_mip(rmm::device_uvector<f_t>& primal_solution,
+                bool status_to_skip,
+                rmm::cuda_stream_view stream_view);
+
+  void undo_lp(rmm::device_uvector<f_t>& primal_solution,
+               rmm::device_uvector<f_t>& dual_solution,
+               rmm::device_uvector<f_t>& reduced_costs,
+               rmm::device_uvector<f_t>& slack,
+               const bool basis_available,
+               rmm::device_uvector<cuopt_variable_status_t>& vstatus,
+               rmm::device_uvector<cuopt_variable_status_t>& row_status,
+               bool status_to_skip,
+               rmm::cuda_stream_view stream_view);
 };
 
 }  // namespace cuopt::linear_programming::detail
