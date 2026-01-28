@@ -1,6 +1,6 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
@@ -154,6 +154,98 @@ TEST(objective_function, arrival_times)
   ASSERT_LE(fabs(stamp[2] - stamp[1]), 5.);
   ASSERT_LE(fabs(stamp[3] - stamp[2]), 5.);
   ASSERT_LE(fabs(stamp[4] - stamp[3]), 5.);
+}
+
+TEST(objective_function, cumulative_cost)
+{
+  float huge_val                 = 1000.;
+  std::vector<float> cost_matrix = {0,        3,        huge_val, huge_val, huge_val, huge_val, 0,
+                                    2,        huge_val, huge_val, huge_val, huge_val, 0,        8,
+                                    huge_val, huge_val, huge_val, huge_val, 0,        2,        0,
+                                    huge_val, huge_val, huge_val, 0};
+
+  std::vector<int> order_locations    = {1, 2, 3, 4};
+  std::vector<int> order_demands      = {5, 3, 1, 1};
+  std::vector<int> vehicle_capacities = {20};
+
+  raft::handle_t handle;
+  auto stream = handle.get_stream();
+
+  auto v_cost_matrix        = cuopt::device_copy(cost_matrix, stream);
+  auto v_order_locations    = cuopt::device_copy(order_locations, stream);
+  auto v_order_demands      = cuopt::device_copy(order_demands, stream);
+  auto v_vehicle_capacities = cuopt::device_copy(vehicle_capacities, stream);
+
+  cuopt::routing::data_model_view_t<int, float> data_model(&handle, 5, 1, 4);
+  data_model.add_cost_matrix(v_cost_matrix.data());
+  data_model.set_order_locations(v_order_locations.data());
+
+  data_model.add_capacity_dimension("demand", v_order_demands.data(), v_vehicle_capacities.data());
+
+  cuopt::routing::solver_settings_t<int, float> settings;
+  settings.set_time_limit(2);
+
+  std::vector<cuopt::routing::objective_t> objectives = {
+    cuopt::routing::objective_t::COST, cuopt::routing::objective_t::CUMULATIVE_COST};
+  std::vector<float> objective_weights = {0.001f, 1.f};
+
+  auto v_objectives        = cuopt::device_copy(objectives, stream);
+  auto v_objective_weights = cuopt::device_copy(objective_weights, stream);
+
+  data_model.set_objective_function(
+    v_objectives.data(), v_objective_weights.data(), v_objective_weights.size());
+  auto routing_solution = cuopt::routing::solve(data_model, settings);
+
+  handle.sync_stream();
+  std::cout << "Routing solution cost: " << routing_solution.get_total_objective() << std::endl;
+  auto host_route = cuopt::routing::host_assignment_t(routing_solution);
+  host_route.print();
+
+  handle.sync_stream();
+}
+
+TEST(objective_function, cumulative_cost_2)
+{
+  std::vector<float> cost_matrix = {0, 2, 4, 3, 0, 0, 4, 3, 0, 2, 0, 3, 0, 2, 4, 0};
+
+  std::vector<int> order_locations    = {1, 2, 3};
+  std::vector<int> order_demands      = {1, 2, 3};
+  std::vector<int> vehicle_capacities = {10, 10};
+
+  raft::handle_t handle;
+  auto stream = handle.get_stream();
+
+  auto v_cost_matrix        = cuopt::device_copy(cost_matrix, stream);
+  auto v_order_locations    = cuopt::device_copy(order_locations, stream);
+  auto v_order_demands      = cuopt::device_copy(order_demands, stream);
+  auto v_vehicle_capacities = cuopt::device_copy(vehicle_capacities, stream);
+
+  cuopt::routing::data_model_view_t<int, float> data_model(&handle, 4, 2, 3);
+  data_model.add_cost_matrix(v_cost_matrix.data());
+  data_model.set_order_locations(v_order_locations.data());
+
+  data_model.add_capacity_dimension("demand", v_order_demands.data(), v_vehicle_capacities.data());
+
+  cuopt::routing::solver_settings_t<int, float> settings;
+  settings.set_time_limit(5);
+
+  std::vector<cuopt::routing::objective_t> objectives = {
+    cuopt::routing::objective_t::COST, cuopt::routing::objective_t::CUMULATIVE_COST};
+  std::vector<float> objective_weights = {0.001f, 1.f};
+
+  auto v_objectives        = cuopt::device_copy(objectives, stream);
+  auto v_objective_weights = cuopt::device_copy(objective_weights, stream);
+
+  data_model.set_objective_function(
+    v_objectives.data(), v_objective_weights.data(), v_objective_weights.size());
+  auto routing_solution = cuopt::routing::solve(data_model, settings);
+
+  handle.sync_stream();
+  std::cout << "Routing solution cost: " << routing_solution.get_total_objective() << std::endl;
+  auto host_route = cuopt::routing::host_assignment_t(routing_solution);
+  host_route.print();
+
+  handle.sync_stream();
 }
 }  // namespace test
 }  // namespace routing

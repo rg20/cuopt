@@ -33,6 +33,8 @@ class capacity_route_t {
       gathered(0, sol_handle_->get_stream()),
       max_to_node(0, sol_handle_->get_stream()),
       max_after(0, sol_handle_->get_stream()),
+      cumulative_cost_forward(0, sol_handle_->get_stream()),
+      cumulative_cost_backward(0, sol_handle_->get_stream()),
       dim_info(dim_info_)
   {
     cuopt_assert(dim_info.n_capacity_dimensions <= default_max_capacity_dim,
@@ -46,6 +48,8 @@ class capacity_route_t {
       gathered(capacity_route.gathered, sol_handle_->get_stream()),
       max_to_node(capacity_route.max_to_node, sol_handle_->get_stream()),
       max_after(capacity_route.max_after, sol_handle_->get_stream()),
+      cumulative_cost_forward(capacity_route.cumulative_cost_forward, sol_handle_->get_stream()),
+      cumulative_cost_backward(capacity_route.cumulative_cost_backward, sol_handle_->get_stream()),
       dim_info(capacity_route.dim_info)
   {
     raft::common::nvtx::range fun_scope("capacity route copy_ctr");
@@ -59,6 +63,8 @@ class capacity_route_t {
     gathered.resize(dim_info.n_capacity_dimensions * max_nodes_per_route, stream);
     max_to_node.resize(dim_info.n_capacity_dimensions * max_nodes_per_route, stream);
     max_after.resize(dim_info.n_capacity_dimensions * max_nodes_per_route, stream);
+    cumulative_cost_forward.resize(max_nodes_per_route, stream);
+    cumulative_cost_backward.resize(max_nodes_per_route, stream);
   }
 
   struct view_t {
@@ -75,7 +81,9 @@ class capacity_route_t {
           capacity_node.demand[i]      = demand[i * stride + idx];
         }
       });
-      capacity_node.n_capacity_dimensions = dim_info.n_capacity_dimensions;
+      capacity_node.n_capacity_dimensions    = dim_info.n_capacity_dimensions;
+      capacity_node.cumulative_cost_forward  = cumulative_cost_forward[idx];
+      capacity_node.cumulative_cost_backward = cumulative_cost_backward[idx];
       return capacity_node;
     }
 
@@ -96,6 +104,7 @@ class capacity_route_t {
           max_to_node[i * stride + idx] = node.max_to_node[i];
         }
       });
+      cumulative_cost_forward[idx] = node.cumulative_cost_forward;
     }
 
     DI void set_backward_data(i_t idx, const capacity_node_t<i_t, f_t>& node)
@@ -103,11 +112,15 @@ class capacity_route_t {
       constexpr_for<capacity_node_t<i_t, f_t>::max_capacity_dim>([&](auto i) {
         if (i < dim_info.n_capacity_dimensions) { max_after[i * stride + idx] = node.max_after[i]; }
       });
+      cumulative_cost_backward[idx] = node.cumulative_cost_backward;
     }
 
     DI void copy_forward_data(const view_t& orig_route, i_t start_idx, i_t end_idx, i_t write_start)
     {
       i_t size = end_idx - start_idx;
+      block_copy(cumulative_cost_forward.subspan(write_start),
+                 orig_route.cumulative_cost_forward.subspan(start_idx),
+                 size);
       constexpr_for<capacity_node_t<i_t, f_t>::max_capacity_dim>([&](auto i) {
         if (i < dim_info.n_capacity_dimensions) {
           block_copy(gathered.subspan(write_start), orig_route.gathered.subspan(start_idx), size);
@@ -125,6 +138,9 @@ class capacity_route_t {
                                i_t write_start)
     {
       i_t size = end_idx - start_idx;
+      block_copy(cumulative_cost_backward.subspan(write_start),
+                 orig_route.cumulative_cost_backward.subspan(start_idx),
+                 size);
       constexpr_for<capacity_node_t<i_t, f_t>::max_capacity_dim>([&](auto i) {
         if (i < dim_info.n_capacity_dimensions) {
           block_copy(max_after.subspan(write_start), orig_route.max_after.subspan(start_idx), size);
@@ -161,8 +177,8 @@ class capacity_route_t {
             max(0, max_to_node[n_nodes + stride * i] - vehicle_info.capacities[i]);
         }
       });
-
-      inf_cost[dim_t::CAP] = infeasibility_cost;
+      obj_cost[objective_t::CUMULATIVE_COST] = cumulative_cost_forward[n_nodes];
+      inf_cost[dim_t::CAP]                   = infeasibility_cost;
     }
 
     static DI thrust::tuple<view_t, i_t*> create_shared_route(
@@ -175,10 +191,12 @@ class capacity_route_t {
       size_t sz   = static_cast<size_t>(v.stride * dim_info.n_capacity_dimensions);
       i_t* sh_ptr = shmem;
 
-      thrust::tie(v.gathered, sh_ptr)    = wrap_ptr_as_span<i_t>(sh_ptr, sz);
-      thrust::tie(v.max_to_node, sh_ptr) = wrap_ptr_as_span<i_t>(sh_ptr, sz);
-      thrust::tie(v.max_after, sh_ptr)   = wrap_ptr_as_span<i_t>(sh_ptr, sz);
-      thrust::tie(v.demand, sh_ptr)      = wrap_ptr_as_span<i_t>(sh_ptr, sz);
+      thrust::tie(v.cumulative_cost_forward, sh_ptr)  = wrap_ptr_as_span<double>(sh_ptr, v.stride);
+      thrust::tie(v.cumulative_cost_backward, sh_ptr) = wrap_ptr_as_span<double>(sh_ptr, v.stride);
+      thrust::tie(v.gathered, sh_ptr)                 = wrap_ptr_as_span<i_t>(sh_ptr, sz);
+      thrust::tie(v.max_to_node, sh_ptr)              = wrap_ptr_as_span<i_t>(sh_ptr, sz);
+      thrust::tie(v.max_after, sh_ptr)                = wrap_ptr_as_span<i_t>(sh_ptr, sz);
+      thrust::tie(v.demand, sh_ptr)                   = wrap_ptr_as_span<i_t>(sh_ptr, sz);
 
       return thrust::make_tuple(v, sh_ptr);
     }
@@ -187,6 +205,8 @@ class capacity_route_t {
     raft::device_span<i_t> max_to_node;
     raft::device_span<i_t> max_after;
     raft::device_span<i_t> demand;
+    raft::device_span<double> cumulative_cost_forward;
+    raft::device_span<double> cumulative_cost_backward;
     capacity_dimension_info_t dim_info;
     i_t stride;
   };
@@ -198,8 +218,12 @@ class capacity_route_t {
     v.gathered    = raft::device_span<i_t>{gathered.data(), gathered.size()};
     v.max_to_node = raft::device_span<i_t>{max_to_node.data(), max_to_node.size()};
     v.max_after   = raft::device_span<i_t>{max_after.data(), max_after.size()};
-    v.dim_info    = dim_info;
-    v.stride      = static_cast<i_t>(demand.size() / dim_info.n_capacity_dimensions);
+    v.cumulative_cost_forward =
+      raft::device_span<double>{cumulative_cost_forward.data(), cumulative_cost_forward.size()};
+    v.cumulative_cost_backward =
+      raft::device_span<double>{cumulative_cost_backward.data(), cumulative_cost_backward.size()};
+    v.dim_info = dim_info;
+    v.stride   = static_cast<i_t>(demand.size() / dim_info.n_capacity_dimensions);
     return v;
   }
 
@@ -211,8 +235,11 @@ class capacity_route_t {
    */
   HDI static size_t get_shared_size(i_t route_size, capacity_dimension_info_t dim_info)
   {
-    // demand, gathered, max_to_node, max_after
-    return dim_info.n_capacity_dimensions * 4 * route_size * sizeof(i_t);
+    // demand, gathered, max_to_node, max_after (i_t arrays)
+    // cumulative_cost_forward, cumulative_cost_backward (double arrays)
+    // Add alignment padding for double arrays (up to alignof(double)-1 bytes)
+    return dim_info.n_capacity_dimensions * 4 * route_size * sizeof(i_t) +
+           2 * route_size * sizeof(double) + (alignof(double) - 1);
   }
 
   //! Data copied from problem
@@ -225,6 +252,9 @@ class capacity_route_t {
   rmm::device_uvector<i_t> max_to_node;
   //! Max load after the node (considering only the final fragment) - backward calculation
   rmm::device_uvector<i_t> max_after;
+
+  rmm::device_uvector<double> cumulative_cost_forward;
+  rmm::device_uvector<double> cumulative_cost_backward;
 
   capacity_dimension_info_t dim_info;
 };

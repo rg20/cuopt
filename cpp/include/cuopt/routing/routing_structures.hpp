@@ -1,6 +1,6 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
@@ -27,6 +27,7 @@ enum class objective_t {
   VARIANCE_ROUTE_SERVICE_TIME,  // Variance in route service times
   PRIZE,                        // Sum of prizes of all orders that are served
   VEHICLE_FIXED_COST,           // Used when fixed vehicle cost are enabled
+  CUMULATIVE_COST,
   SIZE  // Helper enum to keep track of number of supported objective functions
 };
 

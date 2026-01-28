@@ -1,6 +1,6 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
@@ -42,6 +42,10 @@ class capacity_node_t {
   i_t max_to_node[max_capacity_dim] = {0};
   //! Max load after the node (considering only the final fragment) - backward calculation
   i_t max_after[max_capacity_dim] = {0};
+
+  double cumulative_cost_forward  = 0;
+  double cumulative_cost_backward = 0;
+
   //! Dimensions of capacity
   uint8_t n_capacity_dimensions;
 
@@ -49,26 +53,31 @@ class capacity_node_t {
    *  \param[in] actual { Actual node data }
    *  \param[in][out] next { Has to contain the supply loaded/unloaded(negative load). Total
    * gathered and max_to_node will be filled.} */
-  void HDI calculate_forward(capacity_node_t& next, [[maybe_unused]] f_t dummy = 0) const noexcept
+  void HDI calculate_forward(capacity_node_t& next,
+                             [[maybe_unused]] f_t cumulative_distance = 0) const noexcept
   {
     constexpr_for<max_capacity_dim>([&](auto i) {
       if (i < n_capacity_dimensions) {
         next.gathered[i]    = gathered[i] + next.demand[i];
         next.max_to_node[i] = max(next.gathered[i], max_to_node[i]);
       }
+
+      next.cumulative_cost_forward = cumulative_cost_forward + cumulative_distance * next.demand[0];
     });
   }
 
   /*! \brief { Calculate prev node time backward data based on actual node}
    *           \param[in][out] prev { Has to contain the supply loaded/unloaded(negative load).
    * max_after will be filled.} */
-  void HDI calculate_backward(capacity_node_t& prev, [[maybe_unused]] f_t dummy = 0) const noexcept
+  void HDI calculate_backward(capacity_node_t& prev,
+                              [[maybe_unused]] f_t distance = 0) const noexcept
   {
     constexpr_for<max_capacity_dim>([&](auto i) {
       if (i < n_capacity_dimensions) {
         prev.max_after[i] = max(0, max(prev.demand[i], prev.demand[i] + max_after[i]));
       }
     });
+    prev.cumulative_cost_backward = cumulative_cost_backward + distance * max_after[0];
   }
 
   /*! \brief  { Combine information from the begining and ending fragments.}
@@ -76,7 +85,7 @@ class capacity_node_t {
   static i_t HDI combine(const capacity_node_t& prev,
                          const capacity_node_t& next,
                          const VehicleInfo<f_t>& vehicle_info,
-                         const f_t dummy = 0.) noexcept
+                         const f_t cumulative_distance = 0.) noexcept
   {
     i_t excess_of_route = 0;
     constexpr_for<max_capacity_dim>([&](auto i) {

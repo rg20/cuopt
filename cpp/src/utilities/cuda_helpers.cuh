@@ -157,15 +157,20 @@ i_t next_pow2(i_t val)
   return 1 << (raft::log2(val) + 1);
 }
 
-// FIXME:: handle alignment when dealing with different sized precisions
+// Align pointer and wrap as device_span, handling different sized precisions
 template <typename T, typename i_t>
 static DI thrust::tuple<raft::device_span<T>, i_t*> wrap_ptr_as_span(i_t* shmem, size_t sz)
 {
-  T* sh_ptr = (T*)shmem;
-  auto s    = raft::device_span<T>{sh_ptr, sz};
+  // Align pointer to T's alignment requirement
+  constexpr size_t align = alignof(T);
+  uintptr_t ptr          = reinterpret_cast<uintptr_t>(shmem);
+  uintptr_t aligned_ptr  = (ptr + align - 1) & ~(align - 1);
+  T* sh_ptr              = reinterpret_cast<T*>(aligned_ptr);
+
+  auto s = raft::device_span<T>{sh_ptr, sz};
 
   sh_ptr = sh_ptr + sz;
-  return thrust::make_tuple(s, (i_t*)sh_ptr);
+  return thrust::make_tuple(s, reinterpret_cast<i_t*>(sh_ptr));
 }
 
 template <class To, class From>

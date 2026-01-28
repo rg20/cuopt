@@ -127,12 +127,11 @@ class distance_route_t {
                                                               i_t n_nodes_route)
     {
       view_t v;
-      v.dim_info          = dim_info;
-      v.distance_forward  = raft::device_span<double>{(double*)shmem, (size_t)n_nodes_route + 1};
-      v.distance_backward = raft::device_span<double>{
-        (double*)&v.distance_forward.data()[n_nodes_route + 1], (size_t)n_nodes_route + 1};
-
-      i_t* sh_ptr = (i_t*)&v.distance_backward.data()[n_nodes_route + 1];
+      v.dim_info                              = dim_info;
+      i_t* sh_ptr                             = shmem;
+      thrust::tie(v.distance_forward, sh_ptr) = wrap_ptr_as_span<double>(sh_ptr, n_nodes_route + 1);
+      thrust::tie(v.distance_backward, sh_ptr) =
+        wrap_ptr_as_span<double>(sh_ptr, n_nodes_route + 1);
       return thrust::make_tuple(v, sh_ptr);
     }
 
@@ -165,8 +164,9 @@ class distance_route_t {
                                     [[maybe_unused]] cost_dimension_info_t dim_info,
                                     [[maybe_unused]] bool is_tsp = false)
   {
-    // forward, backward
-    return 2 * route_size * sizeof(double);
+    // forward, backward (double arrays)
+    // Add alignment padding for double arrays
+    return 2 * route_size * sizeof(double) + (alignof(double) - 1);
   }
 
   cost_dimension_info_t dim_info;

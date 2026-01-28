@@ -307,8 +307,10 @@ class time_route_t {
   HDI static size_t get_shared_size(i_t route_size, time_dimension_info_t dim_info)
   {
     // departure_forward, excess_forward, departure_backward, excess_backward, window_start,
-    // window_end
-    return (6 + 6 * dim_info.should_compute_travel_time()) * route_size * sizeof(double);
+    // window_end (+ travel time arrays if enabled)
+    // Add alignment padding for double arrays
+    return (6 + 6 * dim_info.should_compute_travel_time()) * route_size * sizeof(double) +
+           (alignof(double) - 1);
   }
 
   time_dimension_info_t dim_info;

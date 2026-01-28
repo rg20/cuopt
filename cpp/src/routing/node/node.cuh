@@ -1,6 +1,6 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
@@ -68,10 +68,22 @@ class node_t {
     loop_over_dimensions(dimensions_info, [&](auto I) {
       double arc_value = get_arc_of_dimension<i_t, f_t, I, is_device>(
         request.info, next_node.request.info, vehicle_info);
+
+      if constexpr (I == (int)dim_t::CAP) {
+        arc_value = next_node.get_dimension<(int)dim_t::DIST>().distance_forward;
+      }
       get_dimension<I>().calculate_forward(next_node.get_dimension<I>(), arc_value);
     });
   }
 
+  template <bool is_device>
+  static double HDI calculate_cumulative_cost(const node_t& node)
+  {
+    auto cap_dim  = node.get_dimension<(int)dim_t::CAP>();
+    auto dist_dim = node.get_dimension<(int)dim_t::DIST>();
+    return cap_dim.cumulative_cost_forward + cap_dim.cumulative_cost_backward +
+           dist_dim.distance_forward * cap_dim.max_to_node[0];
+  }
   // returns the cost delta of the new route after if we combine this node and next_node
   // this does not return the forward data but just the total cost of new route minus the old route
   template <bool is_device>
@@ -82,7 +94,7 @@ class node_t {
                                              objective_cost_t const& old_obj_cost,
                                              infeasible_cost_t const& old_inf_cost) const
   {
-    calculate_forward_all(next_node, vehicle_info);
+    calculate_forward_all<is_device>(next_node, vehicle_info);
 
     objective_cost_t new_obj_cost;
     infeasible_cost_t new_inf_cost;
@@ -94,9 +106,16 @@ class node_t {
 
     double delta =
       infeasible_cost_t::dot(weights, infeasible_cost_t::nominal_diff(new_inf_cost, old_inf_cost));
+
     if (include_objective) {
       // it's a copy
       auto obj_weights = dimensions_info.objective_weights;
+
+      // cumulative cost
+      if (obj_weights[objective_t::CUMULATIVE_COST] != 0.) {
+        double cumulative_cost = calculate_cumulative_cost<is_device>(next_node);
+        new_obj_cost[objective_t::CUMULATIVE_COST] = cumulative_cost;
+      }
       // In moves evalutation this function compares fragments (nodes) with routes. Resulting
       // in a corrupted delta because fragments do not have a vehicle cost. This leads to non
       // improving moves being picked.
@@ -113,6 +132,10 @@ class node_t {
     loop_over_dimensions(dimensions_info, [&](auto I) {
       double arc_value =
         get_arc_of_dimension<i_t, f_t, I>(prev_node.request.info, request.info, vehicle_info);
+      if constexpr (I == (int)dim_t::CAP) {
+        arc_value = get_arc_of_dimension<i_t, f_t, (int)dim_t::DIST>(
+          prev_node.request.info, request.info, vehicle_info);
+      }
       get_dimension<I>().calculate_backward(prev_node.get_dimension<I>(), arc_value);
     });
   }
@@ -142,6 +165,11 @@ class node_t {
     if (include_objective) {
       // it's a copy
       auto obj_weights = dimensions_info.objective_weights;
+      // cumulative cost
+      if (obj_weights[objective_t::CUMULATIVE_COST] != 0.) {
+        double cumulative_cost                     = calculate_cumulative_cost<true>(prev_node);
+        new_obj_cost[objective_t::CUMULATIVE_COST] = cumulative_cost;
+      }
       // In moves evalutation this function compares fragments (nodes) with routes. Resulting
       // in a corrupted delta because fragments do not have a vehicle cost. This leads to non
       // improving moves being picked.
