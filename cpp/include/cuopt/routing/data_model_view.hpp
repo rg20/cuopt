@@ -1,6 +1,6 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
@@ -346,6 +346,23 @@ class data_model_view_t {
   void set_order_prizes(f_t const* prizes, bool validate_input = true);
 
   /**
+   * @brief Set incompatible co-loading commodity types for orders. Orders assigned different
+   * non-negative types cannot be simultaneously loaded on the same vehicle. Orders with type -1
+   * are unconstrained and can co-load with any order. Once set, the solver enforces this constraint
+   * during optimization via a "sum-of-squares" excess measure.
+   *
+   * @param[in] order_types device memory pointer to int8_t commodity type per order.
+   *            Values: -1 = unconstrained, 0..N-1 = typed. Size must be num_orders.
+   */
+  void set_order_incompatible_types(int8_t const* order_types);
+
+  /**
+   * @brief Get the incompatible co-loading order types
+   * @return device_span over the order type array (empty if not set)
+   */
+  raft::device_span<int8_t const> get_order_incompatible_types() const noexcept;
+
+  /**
    * @brief Add precedence constraints for a given order.
    * For each order that needs to come after one or more orders call this
    * function. Currently circular dependencies are not accepted.
@@ -625,6 +642,7 @@ class data_model_view_t {
   detail::order_time_window_t<i_t, f_t> order_tw_{};
 
   raft::device_span<f_t const> order_prizes_;
+  raft::device_span<int8_t const> order_incompatible_types_{};
 
   i_t const* start_locations_{nullptr};
   i_t const* return_locations_{nullptr};

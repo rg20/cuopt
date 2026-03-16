@@ -780,6 +780,42 @@ class DataModel(vehicle_routing_wrapper.DataModel):
         super().set_order_prizes(prizes)
 
     @catch_cuopt_exception
+    def set_order_incompatible_types(self, order_types):
+        """
+        Set incompatible co-loading commodity types for orders.
+
+        Orders assigned different non-negative types cannot be simultaneously
+        loaded on the same vehicle. Orders with type -1 are unconstrained and
+        can co-load with any other order. Once set, the solver enforces this
+        constraint during optimization.
+
+        Parameters
+        ----------
+        order_types : cudf.Series dtype - int8
+            cudf.Series containing the commodity type for each order including
+            the depot (if depot is included in the order list). Values must be
+            -1 (unconstrained) or a non-negative integer type index (0, 1, ...).
+            Size of this series must be equal to num_orders in data model.
+
+        Examples
+        --------
+        >>> from cuopt import routing
+        >>> import cudf
+        >>> # Two order types: type 0 (e.g. refrigerated) and type 1 (e.g. dry)
+        >>> order_types = cudf.Series([-1, 0, 1, 0, 1], dtype='int8')
+        >>> data_model.set_order_incompatible_types(order_types)
+        """
+
+        validate_size(
+            order_types,
+            "order_types",
+            self.get_num_orders(),
+            "number of orders",
+        )
+
+        super().set_order_incompatible_types(order_types)
+
+    @catch_cuopt_exception
     def set_drop_return_trips(self, set_drop_return_trips):
         """
         Control if individual vehicles in the fleet return to the

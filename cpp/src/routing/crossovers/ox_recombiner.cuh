@@ -417,12 +417,8 @@ struct OX {
     cuopt_func_call(double cost_before = A.get_cost(weights));
     A.add_new_routes(routes_to_add);
     cuopt_func_call(double cost_after = A.get_cost(weights));
-    //                Coherence test (check if graph path cost is the same as the inserted
-    //                route):
-    if (A.problem->data_view_ptr->get_vehicle_locations().first == nullptr) {
-      cuopt_assert(abs((cost_after - cost_before) - total_delta) < MOVE_EPSILON,
-                   "Cost mismatch on graph and solution");
-    }
+    cuopt_func_call(cuopt_assert(abs((cost_after - cost_before) - total_delta) < MOVE_EPSILON,
+                                 "Cost mismatch on graph and solution"));
     return true;
   }
 

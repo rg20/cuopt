@@ -1,6 +1,6 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
@@ -404,6 +404,21 @@ void data_model_view_t<i_t, f_t>::set_order_prizes(f_t const* prizes, bool valid
       error_type_t::ValidationError,
       "Prizes must be between 0 and max float32!");
   }
+}
+
+template <typename i_t, typename f_t>
+void data_model_view_t<i_t, f_t>::set_order_incompatible_types(int8_t const* order_types)
+{
+  cuopt_expects(
+    order_types != nullptr, error_type_t::ValidationError, "order_types cannot be null");
+  order_incompatible_types_ = raft::device_span<int8_t const>(order_types, num_orders_);
+}
+
+template <typename i_t, typename f_t>
+raft::device_span<int8_t const> data_model_view_t<i_t, f_t>::get_order_incompatible_types()
+  const noexcept
+{
+  return order_incompatible_types_;
 }
 
 template <typename i_t, typename f_t>

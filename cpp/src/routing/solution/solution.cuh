@@ -1,6 +1,6 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
@@ -92,6 +92,18 @@ DI node_t<i_t, f_t, REQUEST> create_node(const typename problem_t<i_t, f_t>::vie
 
   node.prize_dim.prize = problem.order_info.prizes[node_idx];
 
+  // Set incompatible co-loading fixed data if the constraint is active.
+  if (problem.dimensions_info.has_dimension(dim_t::INCOMPAT)) {
+    node.incompat_dim.order_type = (!problem.order_info.order_type.empty())
+                                     ? problem.order_info.order_type[node_idx]
+                                     : int8_t{-1};
+    node.incompat_dim.is_pickup  = node_info.is_pickup();
+    // VRP service nodes are pre-loaded deliveries.  Use delta=+1 in forward
+    // propagation so that fwd_count counts deliveries made (not negated),
+    // maintaining fwd_count[last] == bwd_count[first] at route boundaries.
+    node.incompat_dim.is_vrp_node = (REQUEST == request_t::VRP);
+  }
+
   node.request = request_info_t<i_t, REQUEST>(node_info, brother_info);
   return node;
 }
@@ -159,6 +171,15 @@ constexpr node_t<i_t, f_t, REQUEST> create_node(const problem_t<i_t, f_t>* probl
   });
 
   node.prize_dim.prize = problem->order_info_h.prizes[node_idx];
+
+  // Set incompatible co-loading fixed data if the constraint is active.
+  if (problem->dimensions_info.has_dimension(dim_t::INCOMPAT)) {
+    node.incompat_dim.order_type  = (!problem->order_info_h.order_type.empty())
+                                      ? problem->order_info_h.order_type[node_idx]
+                                      : int8_t{-1};
+    node.incompat_dim.is_pickup   = node_info.is_pickup();
+    node.incompat_dim.is_vrp_node = (REQUEST == request_t::VRP);
+  }
 
   node.request = request_info_t<i_t, REQUEST>(node_info, brother_info);
   return node;

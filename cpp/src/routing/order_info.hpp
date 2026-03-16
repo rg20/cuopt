@@ -12,6 +12,8 @@
 #include <routing/structures.hpp>
 #include <routing/utilities/md_utils.hpp>
 
+#include <thrust/fill.h>
+
 namespace cuopt {
 namespace routing {
 
@@ -28,8 +30,12 @@ class order_info_t {
       v_is_pickup_index_(num_orders, handle_ptr->get_stream()),
       v_earliest_time_(num_orders, handle_ptr->get_stream()),
       v_latest_time_(num_orders, handle_ptr->get_stream()),
-      v_prizes_(num_orders, handle_ptr->get_stream())
+      v_prizes_(num_orders, handle_ptr->get_stream()),
+      v_order_type_(num_orders, handle_ptr->get_stream())
   {
+    // Default: all orders unconstrained (no commodity type assigned).
+    thrust::fill(
+      handle_ptr->get_thrust_policy(), v_order_type_.begin(), v_order_type_.end(), int8_t{-1});
   }
 
   constexpr i_t get_num_orders() const { return v_earliest_time_.size(); }
@@ -53,6 +59,7 @@ class order_info_t {
       v_is_pickup_index_.resize(size, stream);
     }
     v_prizes_.resize(size, stream);
+    v_order_type_.resize(size, stream);
   }
 
   bool is_pdp() const { return !v_pair_indices_.is_empty(); }
@@ -65,6 +72,7 @@ class order_info_t {
     h.demand          = cuopt::host_copy(v_demand_, stream);
     h.prizes          = cuopt::host_copy(v_prizes_, stream);
     h.order_locations = cuopt::host_copy(v_order_locations_, stream);
+    h.order_type      = cuopt::host_copy(v_order_type_, stream);
     h.depot_included  = depot_included_;
     return h;
   }
@@ -80,6 +88,8 @@ class order_info_t {
     std::vector<demand_i_t> demand;
     std::vector<f_t> prizes;
     std::vector<i_t> order_locations;
+    //! Commodity type per order: -1 = unconstrained, 0..N-1 = typed.
+    std::vector<int8_t> order_type;
     bool depot_included;
   };
 
@@ -110,6 +120,8 @@ class order_info_t {
     raft::device_span<const i_t> earliest_time;
     raft::device_span<const i_t> latest_time;
     raft::device_span<const f_t> prizes;
+    //! Commodity type per order node: -1 = unconstrained.
+    raft::device_span<const int8_t> order_type;
   };
 
   view_t view() const
@@ -127,6 +139,7 @@ class order_info_t {
       raft::device_span<const i_t>{v_earliest_time_.data(), v_earliest_time_.size()};
     v.latest_time = raft::device_span<const i_t>{v_latest_time_.data(), v_latest_time_.size()};
     v.prizes      = raft::device_span<const f_t>{v_prizes_.data(), v_prizes_.size()};
+    v.order_type  = raft::device_span<const int8_t>{v_order_type_.data(), v_order_type_.size()};
     v.nrequests   = get_num_requests();
     return v;
   }
@@ -142,6 +155,9 @@ class order_info_t {
   rmm::device_uvector<i_t> v_earliest_time_;
   rmm::device_uvector<i_t> v_latest_time_;
   rmm::device_uvector<f_t> v_prizes_;
+  //! Commodity type per order node.  -1 = unconstrained (default).
+  //! Values 0..default_n_order_types-1 assign orders to incompatible commodity groups.
+  rmm::device_uvector<int8_t> v_order_type_;
 };
 
 /**

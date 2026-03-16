@@ -1,6 +1,6 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
@@ -233,6 +233,14 @@ void populate_order_info(data_model_view_t<i_t, f_t> const& data_model,
   }
 
   populate_time_windows(data_model, order_info_);
+
+  // Incompatible co-loading order types. Copy user-supplied types if provided; otherwise the
+  // default (-1 = unconstrained) filled in the constructor is already in place.
+  auto order_types = data_model.get_order_incompatible_types();
+  if (!order_types.empty()) {
+    order_info_.v_order_type_.resize(norders, stream_view);
+    raft::copy(order_info_.v_order_type_.data(), order_types.data(), norders, stream);
+  }
 }
 
 template void populate_order_info(data_model_view_t<int, float> const& data_model,

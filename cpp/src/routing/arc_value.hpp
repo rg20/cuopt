@@ -1,6 +1,6 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
@@ -116,6 +116,7 @@ static constexpr double get_arc_of_dimension(const NodeInfo<i_t>& l1,
   } else if constexpr (dim == dim_t::BREAK) {
     return l1.is_break();
   } else {
+    // INCOMPAT and other node-local dimensions do not use arc values.
     return double{};
   }
 }

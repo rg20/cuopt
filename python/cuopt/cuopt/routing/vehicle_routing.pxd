@@ -7,6 +7,7 @@
 # cython: embedsignature = True
 # cython: language_level = 3
 
+from libc.stdint cimport int8_t
 from libcpp cimport bool
 from libcpp.string cimport string
 from libcpp.vector cimport vector
@@ -107,6 +108,8 @@ cdef extern from "cuopt/routing/solve.hpp" namespace "cuopt::routing":
             const i_t *latest) except +
         void set_order_prizes(
             const f_t *prizes) except +
+        void set_order_incompatible_types(
+            const int8_t *order_types) except +
         void add_order_precedence(
             i_t node_id,
             const i_t *preceding_nodes,

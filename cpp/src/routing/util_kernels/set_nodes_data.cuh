@@ -1,6 +1,6 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
@@ -60,6 +60,20 @@ __device__ void set_route_data(typename problem_t<i_t, f_t>::view_t const& probl
       route.template get_dim<dim_t::CAP>().max_to_node[0]           = 0;
       route.template get_dim<dim_t::CAP>().gathered[0]              = 0;
       route.template get_dim<dim_t::CAP>().max_after[n_nodes_route] = 0;
+    }
+    // Initialize incompatible-type boundary conditions (analogous to capacity).
+    if (problem.dimensions_info.has_dimension(dim_t::INCOMPAT)) {
+      auto& incompat_route     = route.template get_dim<dim_t::INCOMPAT>();
+      using incompat_node_type = incompatible_node_t<i_t>;
+      constexpr int n_types    = incompat_node_type::n_order_types;
+      // Forward depot start: all type counts and excess are zero.
+      constexpr_for<n_types>(
+        [&](auto t) { incompat_route.fwd_count[t * incompat_route.stride + 0] = 0; });
+      incompat_route.fwd_excess[0] = 0;
+      // Backward depot end: all type counts and excess are zero.
+      constexpr_for<n_types>(
+        [&](auto t) { incompat_route.bwd_count[t * incompat_route.stride + n_nodes_route] = 0; });
+      incompat_route.bwd_excess[n_nodes_route] = 0;
     }
   }
 }

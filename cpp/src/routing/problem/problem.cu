@@ -339,6 +339,10 @@ void problem_t<i_t, f_t>::populate_dimensions_info()
     break_dim_info.has_breaks = true;
   }
 
+  // incompatible co-loading dimension info
+  const auto& order_incompatible_types = data_view_ptr->get_order_incompatible_types();
+  if (!order_incompatible_types.empty()) { dimensions_info.enable_dimension(dim_t::INCOMPAT); }
+
   // vehicle cost dimension info
   const auto& vehicle_fixed_cost       = data_view_ptr->get_vehicle_fixed_costs();
   const bool vehicle_fixed_cost_exists = !vehicle_fixed_cost.empty();

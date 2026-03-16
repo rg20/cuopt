@@ -28,7 +28,7 @@ from dateutil.relativedelta import relativedelta
 from cuopt.routing.assignment import Assignment
 from cuopt.utilities import type_cast
 
-from libc.stdint cimport uintptr_t
+from libc.stdint cimport int8_t, uintptr_t
 from libc.stdlib cimport free, malloc
 from libc.string cimport memcpy, strcpy, strlen
 from libcpp cimport bool
@@ -175,6 +175,7 @@ cdef class DataModel:
         self.order_earliest = cudf.Series()
         self.order_latest = cudf.Series()
         self.order_prizes = cudf.Series()
+        self.order_incompatible_types = cudf.Series()
         self.pickup_indices = cudf.Series()
         self.delivery_indices = cudf.Series()
         self.objectives = cudf.Series()
@@ -523,6 +524,17 @@ cdef class DataModel:
 
         self.c_data_model_view.get().set_order_prizes(
             <const float *> c_prizes
+        )
+
+    def set_order_incompatible_types(self, order_types):
+        self.order_incompatible_types = order_types.astype(np.dtype(np.int8))
+
+        cdef uintptr_t c_order_types = (
+            self.order_incompatible_types.__cuda_array_interface__['data'][0]
+        )
+
+        self.c_data_model_view.get().set_order_incompatible_types(
+            <const int8_t *> c_order_types
         )
 
     def add_order_precedence(self, node_id, preceding_nodes):
