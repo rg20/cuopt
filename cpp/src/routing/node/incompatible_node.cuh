@@ -272,29 +272,50 @@ class incompatible_node_t {
   }
 
   /**
-   * @brief Accumulate per-dimension infeasibility into @p inf_cost.
+   * @brief Compute the infeasibility contribution at this node for local-search
+   *        delta evaluation.
    *
-   * Reports the full node cost = fwd_excess + bwd_excess (forward and backward
-   * excess are independent; the join-point contribution is evaluated in @c combine).
+   * Must satisfy  get_cost(prev=k, next=k+1) == combine(prev=k, next=k+1)
+   * so that move deltas computed via calculate_forward_all_and_delta are
+   * consistent with the route-level infeasibility stored by compute_cost.
+   *
+   * combine(k, k+1) = fwd_excess[k] + bwd_excess[k+1] - excess(fwd_count[k])
+   *
+   * In get_cost, `this` is the NEXT node (k+1) and `prev` is node k, so:
+   *   get_cost = prev.fwd_excess + this->bwd_excess - excess(prev.fwd_count)
    */
   template <bool is_device = true>
-  HDI void get_cost([[maybe_unused]] const incompatible_node_t& prev,
+  HDI void get_cost(const incompatible_node_t& prev,
                     [[maybe_unused]] const VehicleInfo<double, is_device>& vehicle_info,
                     [[maybe_unused]] const incompatible_dimension_info_t& dim_info,
                     [[maybe_unused]] objective_cost_t& obj_cost,
                     infeasible_cost_t& inf_cost) const noexcept
   {
-    inf_cost[dim_t::INCOMPAT] = static_cast<double>(fwd_excess) + static_cast<double>(bwd_excess);
+    i_t sum_sq{0}, max_sq{0};
+    constexpr_for<n_order_types>([&](auto t) {
+      i_t sq = prev.fwd_count[t] * prev.fwd_count[t];
+      sum_sq += sq;
+      max_sq = max(max_sq, sq);
+    });
+    inf_cost[dim_t::INCOMPAT] =
+      static_cast<double>(prev.fwd_excess + bwd_excess - (sum_sq - max_sq));
   }
 
   template <bool is_device = true>
-  HDI void get_cost([[maybe_unused]] const incompatible_node_t& prev,
+  HDI void get_cost(const incompatible_node_t& prev,
                     [[maybe_unused]] const VehicleInfo<float, is_device>& vehicle_info,
                     [[maybe_unused]] const incompatible_dimension_info_t& dim_info,
                     [[maybe_unused]] objective_cost_t& obj_cost,
                     infeasible_cost_t& inf_cost) const noexcept
   {
-    inf_cost[dim_t::INCOMPAT] = static_cast<double>(fwd_excess) + static_cast<double>(bwd_excess);
+    i_t sum_sq{0}, max_sq{0};
+    constexpr_for<n_order_types>([&](auto t) {
+      i_t sq = prev.fwd_count[t] * prev.fwd_count[t];
+      sum_sq += sq;
+      max_sq = max(max_sq, sq);
+    });
+    inf_cost[dim_t::INCOMPAT] =
+      static_cast<double>(prev.fwd_excess + bwd_excess - (sum_sq - max_sq));
   }
 };
 

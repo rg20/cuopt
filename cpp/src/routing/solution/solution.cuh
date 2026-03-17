@@ -185,7 +185,29 @@ constexpr node_t<i_t, f_t, REQUEST> create_node(const problem_t<i_t, f_t>* probl
   return node;
 }
 
-template <typename i_t, typename f_t, request_t REQUEST>
+template <typename i_t,
+          typename f_t,
+          request_t REQUEST,
+          std::enable_if_t<REQUEST == request_t::PDP, bool> = true>
+constexpr node_t<i_t, f_t, REQUEST> create_node(const problem_t<i_t, f_t>* problem, i_t node_id)
+{
+  bool is_pickup       = problem->is_pickup_h[node_id];
+  auto this_node_type  = is_pickup ? node_type_t::PICKUP : node_type_t::DELIVERY;
+  auto other_node_type = is_pickup ? node_type_t::DELIVERY : node_type_t::PICKUP;
+  i_t other_node_id    = problem->pair_indices_h[node_id];
+
+  const auto this_node_info =
+    NodeInfo<i_t>(node_id, problem->order_info_h.get_order_location(node_id), this_node_type);
+  const auto other_node_info = NodeInfo<i_t>(
+    other_node_id, problem->order_info_h.get_order_location(other_node_id), other_node_type);
+
+  return create_node<i_t, f_t, REQUEST>(problem, this_node_info, other_node_info);
+}
+
+template <typename i_t,
+          typename f_t,
+          request_t REQUEST,
+          std::enable_if_t<REQUEST == request_t::VRP, bool> = true>
 constexpr node_t<i_t, f_t, REQUEST> create_node(const problem_t<i_t, f_t>* problem, i_t node_id)
 {
   auto this_node_type = node_type_t::DELIVERY;
