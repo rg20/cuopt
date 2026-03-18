@@ -415,10 +415,133 @@ struct OX {
       tmp_node_info.clear();
     }
     cuopt_func_call(double cost_before = A.get_cost(weights));
+    // Pre-compute per-route expected costs (host-side) for debug comparison.
+    std::vector<double> dbg_route_costs;
+    {
+      const auto& dbg_dims = A.problem->dimensions_info;
+      for (auto const& [veh_id_add, route_nodes] : routes_to_add) {
+        auto dbg_vehicle_info = A.problem->get_vehicle_info(veh_id_add);
+        auto dbg_cuopt_w      = get_cuopt_cost(weights);
+        using node_type       = node_t<int, float, Solution::request_type>;
+        auto sdni             = A.problem->start_depot_node_infos_h[veh_id_add];
+        auto rdni             = A.problem->return_depot_node_infos_h[veh_id_add];
+        // prev_node: last visited service node; ret_depot: fresh return depot
+        node_type ret_depot(dbg_dims);
+        ret_depot =
+          create_depot_node<int, float, Solution::request_type>(A.problem, rdni, sdni, veh_id_add);
+        node_type prev_node(dbg_dims);
+        prev_node =
+          create_depot_node<int, float, Solution::request_type>(A.problem, sdni, rdni, veh_id_add);
+        for (size_t k = 0; k < route_nodes.size(); ++k) {
+          node_type curr(dbg_dims);
+          curr = create_node<int, float, Solution::request_type>(A.problem, route_nodes[k].node());
+          prev_node.calculate_forward_all(curr, dbg_vehicle_info);
+          prev_node = curr;
+        }
+        double route_cost = node_type::cost_combine(prev_node,
+                                                    ret_depot,
+                                                    dbg_vehicle_info,
+                                                    true,
+                                                    dbg_cuopt_w,
+                                                    objective_cost_t{},
+                                                    infeasible_cost_t{});
+        dbg_route_costs.push_back(route_cost);
+        auto& last_incompat = prev_node.incompat_dim;
+        int sum_sq2         = 0;
+        int max_sq2         = 0;
+        for (int t = 0; t < 2; ++t) {
+          int sq = last_incompat.fwd_count[t] * last_incompat.fwd_count[t];
+          sum_sq2 += sq;
+          max_sq2 = std::max(max_sq2, sq);
+        }
+        double raw_incompat = static_cast<double>(
+          last_incompat.fwd_excess + ret_depot.incompat_dim.bwd_excess - (sum_sq2 - max_sq2));
+        fprintf(stderr, "[OX-DBG] route nodes:");
+        for (auto const& ni : route_nodes) {
+          fprintf(stderr, " %d", ni.node());
+        }
+        fprintf(stderr,
+                " | fwd_excess=%d fwd_count={%d,%d} raw_incompat=%.1f route_cost=%.4f\n",
+                last_incompat.fwd_excess,
+                last_incompat.fwd_count[0],
+                last_incompat.fwd_count[1],
+                raw_incompat,
+                route_cost);
+        fprintf(stderr, "[OX-DBG] debug_wgt=%.6f\n", dbg_cuopt_w[(int)dim_t::INCOMPAT]);
+        fprintf(stderr, "[OX-DBG] weights=%.6f\n", weights[(int)dim_t::INCOMPAT]);
+        fflush(stderr);
+      }
+    }
+
     A.add_new_routes(routes_to_add);
     cuopt_func_call(double cost_after = A.get_cost(weights));
-    cuopt_func_call(cuopt_assert(abs((cost_after - cost_before) - total_delta) < MOVE_EPSILON,
-                                 "Cost mismatch on graph and solution"));
+    cuopt_func_call(double diff = (cost_after - cost_before) - total_delta);
+    if (abs(diff) >= MOVE_EPSILON) {
+      fprintf(stderr,
+              "[OX] INCOMPAT mismatch: cost_before=%.6f cost_after=%.6f "
+              "total_delta=%.6f diff=%.6f INCOMPAT_weight=%.6f\n",
+              cost_before,
+              cost_after,
+              total_delta,
+              diff,
+              weights[(int)dim_t::INCOMPAT]);
+      double recomputed_delta = 0.;
+      for (double c : dbg_route_costs) {
+        recomputed_delta += c;
+      }
+      fprintf(stderr,
+              "[OX] recomputed_delta(host)=%.6f total_delta(BF)=%.6f\n",
+              recomputed_delta,
+              total_delta);
+      fprintf(stderr,
+              "[OX] n_routes_after=%d routes_to_add.size()=%zu\n",
+              A.sol.n_routes,
+              routes_to_add.size());
+      auto dbg_inf = A.sol.get_infeasibility_cost();
+      fprintf(stderr, "[OX] raw_INCOMPAT_total=%.6f\n", dbg_inf[dim_t::INCOMPAT]);
+      // Read back GPU fwd_excess and order_type for route 0
+      {
+        auto& dbg_r     = A.sol.get_route(0);
+        auto& dbg_ic    = dbg_r.template get_dim<dim_t::INCOMPAT>();
+        auto* stream    = A.sol.sol_handle->get_stream().value();
+        int n_excess_sz = static_cast<int>(dbg_ic.fwd_excess.size());
+        int n_ot_sz     = static_cast<int>(dbg_ic.order_type_data.size());
+        std::vector<int> h_fwd_excess(n_excess_sz);
+        std::vector<int> h_order_type(n_ot_sz);
+        RAFT_CUDA_TRY(cudaMemcpyAsync(h_fwd_excess.data(),
+                                      dbg_ic.fwd_excess.data(),
+                                      n_excess_sz * sizeof(int),
+                                      cudaMemcpyDeviceToHost,
+                                      stream));
+        RAFT_CUDA_TRY(cudaMemcpyAsync(h_order_type.data(),
+                                      dbg_ic.order_type_data.data(),
+                                      n_ot_sz * sizeof(int),
+                                      cudaMemcpyDeviceToHost,
+                                      stream));
+        RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+        int n_srv = A.sol.get_route(0).get_num_service_nodes();
+        fprintf(stderr, "[OX] route0 n_service_nodes=%d fwd_excess[0..%d]: ", n_srv, n_srv + 1);
+        for (int i = 0; i <= n_srv + 1 && i < n_excess_sz; ++i)
+          fprintf(stderr, "%d ", h_fwd_excess[i]);
+        fprintf(stderr, "\n[OX] route0 order_type[0..%d]: ", n_srv + 1);
+        for (int i = 0; i <= n_srv + 1 && i < n_ot_sz; ++i)
+          fprintf(stderr, "%d ", h_order_type[i]);
+        int n_ip_sz = static_cast<int>(dbg_ic.is_pickup_data.size());
+        std::vector<int> h_is_pickup(n_ip_sz);
+        RAFT_CUDA_TRY(cudaMemcpyAsync(h_is_pickup.data(),
+                                      dbg_ic.is_pickup_data.data(),
+                                      n_ip_sz * sizeof(int),
+                                      cudaMemcpyDeviceToHost,
+                                      stream));
+        RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+        fprintf(stderr, "\n[OX] route0 is_pickup[0..%d]: ", n_srv + 1);
+        for (int i = 0; i <= n_srv + 1 && i < n_ip_sz; ++i)
+          fprintf(stderr, "%d ", h_is_pickup[i]);
+        fprintf(stderr, "\n");
+      }
+      fflush(stderr);
+    }
+    cuopt_func_call(cuopt_assert(abs(diff) < MOVE_EPSILON, "Cost mismatch on graph and solution"));
     return true;
   }
 

@@ -171,15 +171,27 @@ class incompatible_route_t {
                          [[maybe_unused]] objective_cost_t& obj_cost,
                          infeasible_cost_t& inf_cost) const noexcept
     {
-      // Use only the forward excess at the last node (which equals fwd_excess
-      // at the return depot after propagation through all PDP nodes).
-      // VRP nodes do not contribute to fwd_excess (see incompatible_node_t),
-      // so this is always 0 for VRP routes.
-      // cost_combine propagates forward to a fresh depot (bwd_excess=0) and
-      // calls get_cost, which returns fwd_excess + 0 = fwd_excess[n_nodes].
-      // This keeps compute_cost consistent with cost_combine so that
-      // total_delta == cost_after - cost_before in the OX coherence check.
-      inf_cost[dim_t::INCOMPAT] = static_cast<double>(fwd_excess[n_nodes]);
+      // The INCOMPAT cost must match cost_combine(last_fwd_node, fresh_return_depot)
+      // so that total_delta == cost_after - cost_before in the OX coherence check.
+      //
+      // cost_combine calls get_cost(prev=last_node, next=return_depot):
+      //   get_cost = fwd_excess[last] + bwd_excess[depot=0] - excess(fwd_count[last])
+      //            = fwd_excess[n_nodes] - excess(fwd_count[n_nodes])
+      //
+      // For balanced (PDP-feasible) routes fwd_count[last] == 0 so this
+      // reduces to fwd_excess[n_nodes] — the same value as before.
+      // For unbalanced fragments encountered during the infeasible search
+      // phase, both compute_cost and cost_combine now agree, which keeps the
+      // OX coherence assertion (abs(cost_after-cost_before - total_delta) < eps)
+      // from firing on infeasible intermediate solutions.
+      i_t sum_sq{0}, max_sq{0};
+      constexpr_for<n_order_types>([&](auto t) {
+        i_t c  = fwd_count[t * stride + n_nodes];
+        i_t sq = c * c;
+        sum_sq += sq;
+        max_sq = max(max_sq, sq);
+      });
+      inf_cost[dim_t::INCOMPAT] = static_cast<double>(fwd_excess[n_nodes] - (sum_sq - max_sq));
     }
 
     /**
