@@ -667,8 +667,7 @@ bool find_vrp_moves(solution_t<i_t, f_t, REQUEST>& sol,
   }
   cuopt_assert(n_blocks > 0, "n_blocks should be positive");
   cuopt_expects(n_blocks > 0, error_type_t::RuntimeError, "A runtime error occurred!");
-  // __launch_bounds__ prevents primary-constructor type deduction; use bool overload.
-  block_workspace_t find_ws(sh_size <= block_workspace_t::shmem_cap_static(),
+  block_workspace_t find_ws(reinterpret_cast<const void*>(find_vrp_moves_kernel<i_t, f_t, REQUEST>),
                             sh_size,
                             n_blocks,
                             sol.sol_handle->get_stream());

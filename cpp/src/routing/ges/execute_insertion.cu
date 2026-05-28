@@ -302,10 +302,12 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::execute_best_insertion_ejectio
 
   // Didn't manage to insert even with deleting
   if (fragment_size >= max_fragment_size || time_stop_condition_reached()) { return false; }
-  // NTTP kernel (__launch_bounds__ + int literal): cannot call set_shmem_of_kernel or
-  // cudaFuncSetAttribute in a dependent template context. Use global memory fallback.
   auto select_sh = shared_for_delete_array + shared_for_tmp_route;
-  block_workspace_t select_ws(false, select_sh, 1, solution_ptr->sol_handle->get_stream());
+  block_workspace_t select_ws(
+    reinterpret_cast<const void*>(select_tmp_and_execute_insert<1024, i_t, f_t, REQUEST>),
+    select_sh,
+    1,
+    solution_ptr->sol_handle->get_stream());
   // Kernel almost single threaded, more threads just helps to copy route faster
   select_tmp_and_execute_insert<1024, i_t, f_t, REQUEST>
     <<<1, 1024, select_ws.shmem_size(), solution_ptr->sol_handle->get_stream()>>>(
@@ -362,8 +364,11 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::perform_insertion(
 
   size_t shared_for_tmp_route =
     solution_ptr->check_routes_can_insert_and_get_sh_size(request_info_t<i_t, REQUEST>::size());
-  // __launch_bounds__ kernel: NVCC cannot deduce Function* in template context.
-  block_workspace_t exec_ws(false, shared_for_tmp_route, 1, solution_ptr->sol_handle->get_stream());
+  block_workspace_t exec_ws(
+    reinterpret_cast<const void*>(execute_feasible_insert<i_t, f_t, REQUEST>),
+    shared_for_tmp_route,
+    1,
+    solution_ptr->sol_handle->get_stream());
 
   execute_feasible_insert<i_t, f_t, REQUEST>
     <<<1, 1024, exec_ws.shmem_size(), solution_ptr->sol_handle->get_stream()>>>(
@@ -391,9 +396,11 @@ i_t guided_ejection_search_t<i_t, f_t, REQUEST>::find_single_insertion(
     found_sol_t::uninitialized);
 
   size_t shared_for_tmp_route = solution_ptr->check_routes_can_insert_and_get_sh_size();
-  // NTTP kernel: cannot set shmem attribute in a dependent template context.
   block_workspace_t all_ws(
-    false, shared_for_tmp_route, grid_size, solution_ptr->sol_handle->get_stream());
+    reinterpret_cast<const void*>(get_all_feasible_insertion<threads_per_block, i_t, f_t, REQUEST>),
+    shared_for_tmp_route,
+    grid_size,
+    solution_ptr->sol_handle->get_stream());
   get_all_feasible_insertion<threads_per_block, i_t, f_t, REQUEST>
     <<<grid_size, threads_per_block, all_ws.shmem_size(), solution_ptr->sol_handle->get_stream()>>>(
       solution_ptr->view(),

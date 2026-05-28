@@ -82,6 +82,7 @@ i_t guided_ejection_search_t<i_t, f_t, REQUEST>::try_multiple_insert(i_t n_inser
                                                                      double excess_limit,
                                                                      bool include_objective)
 {
+  RAFT_CHECK_CUDA(solution_ptr->sol_handle->get_stream());
   auto stream        = solution_ptr->sol_handle->get_stream();
   const i_t n_blocks = solution_ptr->n_routes * n_insertions;
 
@@ -100,9 +101,13 @@ i_t guided_ejection_search_t<i_t, f_t, REQUEST>::try_multiple_insert(i_t n_inser
 
     async_fill(best_squeeze_per_cand, cand_t{0, 0, std::numeric_limits<double>::max()}, stream);
     async_fill(best_squeeze_per_route, cand_t{0, 0, std::numeric_limits<double>::max()}, stream);
-
-    // NTTP kernel: cannot set shmem attribute in a dependent template context.
-    block_workspace_t find_all_ws(false, sh_size, n_blocks, stream);
+    RAFT_CHECK_CUDA(solution_ptr->sol_handle->get_stream());
+    block_workspace_t find_all_ws(
+      reinterpret_cast<const void*>(find_all_squeeze_pos<i_t, f_t, REQUEST, squeeze_mode>),
+      sh_size,
+      n_blocks,
+      stream);
+    RAFT_CHECK_CUDA(solution_ptr->sol_handle->get_stream());
     // insert the request greedily to a position that will generate the least excess
     find_all_squeeze_pos<i_t, f_t, REQUEST, squeeze_mode>
       <<<n_blocks, TPB, find_all_ws.shmem_size(), stream>>>(
@@ -128,8 +133,11 @@ i_t guided_ejection_search_t<i_t, f_t, REQUEST>::try_multiple_insert(i_t n_inser
     }
 
     size_t move_blocks = solution_ptr->get_n_routes();
-    // NTTP kernel: cannot set shmem attribute in a dependent template context.
-    block_workspace_t exec_all_ws(false, shmem_for_route, move_blocks, stream);
+    block_workspace_t exec_all_ws(
+      reinterpret_cast<const void*>(execute_all_move<i_t, f_t, REQUEST, squeeze_mode>),
+      shmem_for_route,
+      move_blocks,
+      stream);
     // execute squeeze moves
     execute_all_move<i_t, f_t, REQUEST, squeeze_mode>
       <<<move_blocks, TPB, exec_all_ws.shmem_size(), stream>>>(

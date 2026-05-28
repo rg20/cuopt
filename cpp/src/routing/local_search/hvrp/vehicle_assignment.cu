@@ -41,8 +41,11 @@ auto compute_route_cost_differences(solution_t<i_t, f_t, REQUEST>& sol,
     sizeof(double) *
       (std::max(sol.problem_ptr->get_num_buckets(), min_bucket_entries) + min_bucket_entries) +
     sizeof(i_t) * min_bucket_entries;
-  // NTTP kernel: cannot set shmem attribute in a dependent template context.
-  block_workspace_t diff_ws(false, sh_size, n_blocks, sol.sol_handle->get_stream());
+  block_workspace_t diff_ws(
+    reinterpret_cast<const void*>(compute_route_cost_differences_kernel<i_t, f_t, REQUEST, TPB>),
+    sh_size,
+    n_blocks,
+    sol.sol_handle->get_stream());
 
   compute_route_cost_differences_kernel<i_t, f_t, REQUEST, TPB>
     <<<n_blocks, TPB, diff_ws.shmem_size(), sol.sol_handle->get_stream()>>>(

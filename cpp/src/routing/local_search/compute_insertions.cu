@@ -826,8 +826,12 @@ void find_insertions(solution_t<i_t, f_t, REQUEST>& sol,
   size_t shared_size = get_sh_size_for_compute_insertions(sol);
 
   if (search_type == search_type_t::IMPROVE) {
-    // NTTP kernel: cannot set shmem attribute in a dependent template context.
-    block_workspace_t ws(false, shared_size, n_blocks, sol.sol_handle->get_stream());
+    block_workspace_t ws(
+      reinterpret_cast<const void*>(
+        find_insertions_kernel<i_t, f_t, REQUEST, search_type_t::IMPROVE, insert_unserviced>),
+      shared_size,
+      n_blocks,
+      sol.sol_handle->get_stream());
     find_insertions_kernel<i_t, f_t, REQUEST, search_type_t::IMPROVE, insert_unserviced>
       <<<n_blocks, TPB, ws.shmem_size(), sol.sol_handle->get_stream()>>>(
         sol.view(), move_candidates.view(), seed_generator::get_seed(), ws.view());
@@ -838,16 +842,24 @@ void find_insertions(solution_t<i_t, f_t, REQUEST>& sol,
     if (search_type == search_type_t::CROSS) {
       n_blocks =
         move_candidates.number_of_blocks_per_ls_route * sol.get_n_routes() + sol.get_num_requests();
-      // NTTP kernel: cannot set shmem attribute in a dependent template context.
-      block_workspace_t ws(false, shared_size, n_blocks, sol.sol_handle->get_stream());
+      block_workspace_t ws(
+        reinterpret_cast<const void*>(
+          find_insertions_kernel<i_t, f_t, REQUEST, search_type_t::CROSS, insert_unserviced>),
+        shared_size,
+        n_blocks,
+        sol.sol_handle->get_stream());
       find_insertions_kernel<i_t, f_t, REQUEST, search_type_t::CROSS, insert_unserviced>
         <<<n_blocks, TPB, ws.shmem_size(), sol.sol_handle->get_stream()>>>(
           sol.view(), move_candidates.view(), seed_generator::get_seed(), ws.view());
     } else if (search_type == search_type_t::RANDOM) {
       // we don't search for relocates in random.
       n_blocks = sol.get_num_requests();
-      // NTTP kernel: cannot set shmem attribute in a dependent template context.
-      block_workspace_t ws(false, shared_size, n_blocks, sol.sol_handle->get_stream());
+      block_workspace_t ws(
+        reinterpret_cast<const void*>(
+          find_insertions_kernel<i_t, f_t, REQUEST, search_type_t::RANDOM, insert_unserviced>),
+        shared_size,
+        n_blocks,
+        sol.sol_handle->get_stream());
       find_insertions_kernel<i_t, f_t, REQUEST, search_type_t::RANDOM, insert_unserviced>
         <<<n_blocks, TPB, ws.shmem_size(), sol.sol_handle->get_stream()>>>(
           sol.view(), move_candidates.view(), seed_generator::get_seed(), ws.view());
@@ -876,8 +888,12 @@ void find_unserviced_insertions(solution_t<i_t, f_t, REQUEST>& sol,
 
   size_t shared_size = get_sh_size_for_compute_insertions(sol);
 
-  // NTTP kernel: cannot set shmem attribute in a dependent template context.
-  block_workspace_t ws(false, shared_size, n_blocks, sol.sol_handle->get_stream());
+  block_workspace_t ws(
+    reinterpret_cast<const void*>(
+      find_insertions_kernel<i_t, f_t, REQUEST, search_type_t::IMPROVE, insert_unserviced>),
+    shared_size,
+    n_blocks,
+    sol.sol_handle->get_stream());
   find_insertions_kernel<i_t, f_t, REQUEST, search_type_t::IMPROVE, insert_unserviced>
     <<<n_blocks, TPB, ws.shmem_size(), sol.sol_handle->get_stream()>>>(
       sol.view(), move_candidates.view(), seed_generator::get_seed(), ws.view());

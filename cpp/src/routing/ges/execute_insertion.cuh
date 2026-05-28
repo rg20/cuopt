@@ -1,6 +1,6 @@
 /* clang-format off */
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 /* clang-format on */
@@ -9,6 +9,7 @@
 
 #include "../solution/solution.cuh"
 #include "found_solution.cuh"
+#include "routing/utilities/block_workspace.cuh"
 
 namespace cuopt {
 namespace routing {
@@ -67,7 +68,8 @@ __global__ void select_feasible_insert(typename solution_t<i_t, f_t, REQUEST>::v
 template <typename i_t, typename f_t, request_t REQUEST>
 __global__ void execute_feasible_insert(typename solution_t<i_t, f_t, REQUEST>::view_t view,
                                         const request_info_t<i_t, REQUEST>* request_id,
-                                        found_sol_t selected_candidate);
+                                        found_sol_t selected_candidate,
+                                        block_workspace_t::view_t block_workspace);
 
 // Add ejected nodes to ejection pool
 // Select temp route, execute the request insertion and write it back to route global memory
@@ -78,7 +80,8 @@ __global__ void select_tmp_and_execute_insert(
   uint64_t* __restrict__ feasible_candidates,
   typename ejection_pool_t<request_info_t<i_t, REQUEST>>::view_t EP,
   i_t fragment_step,
-  i_t fragment_size);
+  i_t fragment_size,
+  block_workspace_t::view_t block_workspace);
 }  // namespace detail
 }  // namespace routing
 }  // namespace cuopt

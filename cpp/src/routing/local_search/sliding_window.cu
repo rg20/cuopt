@@ -1063,9 +1063,11 @@ bool local_search_t<i_t, f_t, REQUEST>::perform_sliding_window(
   cuopt_assert(n_blocks > 0, "n_blocks should be positive");
   cuopt_expects(n_blocks > 0, error_type_t::RuntimeError, "A runtime error occurred!");
   if (is_cvrp) {
-    // NTTP kernel: cannot set shmem attribute in a dependent template context.
     block_workspace_t sw_ws(
-      false, shared_for_tmp_route, n_blocks, solution.sol_handle->get_stream());
+      reinterpret_cast<const void*>(kernel_perform_sliding_window<i_t, f_t, REQUEST, true>),
+      shared_for_tmp_route,
+      n_blocks,
+      solution.sol_handle->get_stream());
     kernel_perform_sliding_window<i_t, f_t, REQUEST, true>
       <<<n_blocks,  // One block for each node
          thread_per_block,
@@ -1077,9 +1079,11 @@ bool local_search_t<i_t, f_t, REQUEST>::perform_sliding_window(
                                               blocks_per_node,
                                               sw_ws.view());
   } else {
-    // NTTP kernel: cannot set shmem attribute in a dependent template context.
     block_workspace_t sw_ws(
-      false, shared_for_tmp_route, n_blocks, solution.sol_handle->get_stream());
+      reinterpret_cast<const void*>(kernel_perform_sliding_window<i_t, f_t, REQUEST, false>),
+      shared_for_tmp_route,
+      n_blocks,
+      solution.sol_handle->get_stream());
     kernel_perform_sliding_window<i_t, f_t, REQUEST, false>
       <<<n_blocks,  // One block for each node
          thread_per_block,

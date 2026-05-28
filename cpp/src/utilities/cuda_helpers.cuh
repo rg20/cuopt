@@ -270,6 +270,39 @@ inline bool set_shmem_of_kernel(Function* function, size_t dynamic_request_size)
   return true;
 }
 
+/**
+ * @brief Identical to the typed overload but accepts a const void* kernel pointer.
+ * Use for NTTP or __launch_bounds__ kernels where the type cannot be deduced.
+ */
+inline bool set_shmem_of_kernel(const void* function, size_t dynamic_request_size)
+{
+  static std::shared_mutex mtx;
+  static std::unordered_map<const void*, size_t> shmem_sizes;
+
+  if (dynamic_request_size != 0) {
+    dynamic_request_size = raft::alignTo(dynamic_request_size, size_t(1024));
+    {
+      std::shared_lock<std::shared_mutex> rlock(mtx);
+      auto it = shmem_sizes.find(function);
+      if (it != shmem_sizes.end() && dynamic_request_size <= it->second) { return true; }
+    }
+    std::unique_lock<std::shared_mutex> wlock(mtx);
+    size_t current_size = shmem_sizes.count(function) ? shmem_sizes[function] : 0;
+    if (dynamic_request_size > current_size) {
+      auto err = cudaFuncSetAttribute(
+        function, cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_request_size);
+      if (err == cudaSuccess) {
+        shmem_sizes[function] = dynamic_request_size;
+        return true;
+      } else {
+        cudaGetLastError();
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 template <typename T>
 DI void sorted_insert(T* array, T item, int curr_size, int max_size)
 {

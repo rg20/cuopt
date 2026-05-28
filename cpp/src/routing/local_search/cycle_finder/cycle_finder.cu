@@ -31,8 +31,10 @@ bool ExactCycleFinder<i_t, f_t, max_routes>::call_init(graph_t<i_t, f_t>& graph)
   auto n_blocks   = n_vertices;
   int level       = 0;
   size_t sh_size  = max_graph_nodes_per_row * (sizeof(double) + sizeof(i_t));
-  // NTTP kernel: cannot set shmem attribute in a dependent template context.
-  block_workspace_t init_ws(false, sh_size, n_blocks, handle_ptr->get_stream());
+  block_workspace_t init_ws(reinterpret_cast<const void*>(init_kernel<i_t, f_t, max_routes>),
+                            sh_size,
+                            n_blocks,
+                            handle_ptr->get_stream());
 
   init_kernel<i_t, f_t, max_routes>
     <<<n_blocks, n_threads, init_ws.shmem_size(), handle_ptr->get_stream()>>>(
@@ -112,8 +114,11 @@ bool ExactCycleFinder<i_t, f_t, max_routes>::call_find(graph_t<i_t, f_t>& graph,
   // cycle_candidates.reset(n_blocks, handle_ptr);
   bool last_level = level == (max_level - 1);
   if (last_level) {
-    // NTTP kernel: cannot set shmem attribute in a dependent template context.
-    block_workspace_t find_ws(false, sh_size, n_blocks, handle_ptr->get_stream());
+    block_workspace_t find_ws(
+      reinterpret_cast<const void*>(find_kernel<i_t, f_t, max_routes, true>),
+      sh_size,
+      n_blocks,
+      handle_ptr->get_stream());
     find_kernel<i_t, f_t, max_routes, true>
       <<<n_blocks, n_threads, find_ws.shmem_size(), handle_ptr->get_stream()>>>(
         level,
@@ -124,8 +129,11 @@ bool ExactCycleFinder<i_t, f_t, max_routes>::call_find(graph_t<i_t, f_t>& graph,
         depot_included,
         find_ws.view());
   } else {
-    // NTTP kernel: cannot set shmem attribute in a dependent template context.
-    block_workspace_t find_ws(false, sh_size, n_blocks, handle_ptr->get_stream());
+    block_workspace_t find_ws(
+      reinterpret_cast<const void*>(find_kernel<i_t, f_t, max_routes, false>),
+      sh_size,
+      n_blocks,
+      handle_ptr->get_stream());
     find_kernel<i_t, f_t, max_routes, false>
       <<<n_blocks, n_threads, find_ws.shmem_size(), handle_ptr->get_stream()>>>(
         level,

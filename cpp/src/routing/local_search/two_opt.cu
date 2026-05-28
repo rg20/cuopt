@@ -439,8 +439,11 @@ bool local_search_t<i_t, f_t, REQUEST>::perform_two_opt(
     moved_regions_.resize(sol.get_n_routes() * sol.get_max_active_nodes_for_all_routes(),
                           sol.sol_handle->get_stream());
     async_fill(moved_regions_, 0, sol.sol_handle->get_stream());
-    // NTTP kernel: cannot set shmem attribute in a dependent template context.
-    block_workspace_t recycle_ws(false, sh_size, sol.get_n_routes(), sol.sol_handle->get_stream());
+    block_workspace_t recycle_ws(
+      reinterpret_cast<const void*>(execute_recycle<i_t, f_t, REQUEST, n_threads>),
+      sh_size,
+      sol.get_n_routes(),
+      sol.sol_handle->get_stream());
     execute_recycle<i_t, f_t, REQUEST, n_threads>
       <<<sol.get_n_routes(), n_threads, recycle_ws.shmem_size(), sol.sol_handle->get_stream()>>>(
         sol.view(),

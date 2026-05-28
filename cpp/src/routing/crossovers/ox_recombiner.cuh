@@ -911,8 +911,11 @@ struct OX {
 
     auto const n_blocks = n_buckets * (d_offspring.size() - 1);
 
-    // NTTP kernel: cannot set shmem attribute in a dependent template context.
-    block_workspace_t calc_ws(false, shmem, n_blocks, A.sol.sol_handle->get_stream());
+    block_workspace_t calc_ws(reinterpret_cast<const void*>(
+                                calculate_edge_costs_kernel<int, float, Solution::request_type>),
+                              shmem,
+                              n_blocks,
+                              A.sol.sol_handle->get_stream());
     calculate_edge_costs_kernel<int, float, Solution::request_type>
       <<<n_blocks, 128, calc_ws.shmem_size(), A.sol.sol_handle->get_stream()>>>(
         A.sol.view(),
