@@ -136,6 +136,7 @@ solver_settings_t<i_t, f_t>::solver_settings_t() : pdlp_settings(), mip_settings
     {CUOPT_PDLP_SOLVER_MODE, reinterpret_cast<int*>(&pdlp_settings.pdlp_solver_mode), CUOPT_PDLP_SOLVER_MODE_STABLE1, CUOPT_PDLP_SOLVER_MODE_STABLE3, CUOPT_PDLP_SOLVER_MODE_STABLE3},
     {CUOPT_METHOD, reinterpret_cast<int*>(&pdlp_settings.method), CUOPT_METHOD_CONCURRENT, CUOPT_METHOD_BARRIER, CUOPT_METHOD_CONCURRENT},
     {CUOPT_METHOD, reinterpret_cast<int*>(&mip_settings.method), CUOPT_METHOD_CONCURRENT, CUOPT_METHOD_BARRIER, CUOPT_METHOD_CONCURRENT},
+    {CUOPT_DUAL_SIMPLEX_PRICING, &pdlp_settings.dual_simplex_pricing, CUOPT_DUAL_SIMPLEX_PRICING_STEEPEST_EDGE, CUOPT_DUAL_SIMPLEX_PRICING_MAX_INFEASIBILITY, CUOPT_DUAL_SIMPLEX_PRICING_STEEPEST_EDGE},
     {CUOPT_NUM_CPU_THREADS, &mip_settings.num_cpu_threads, -1, std::numeric_limits<i_t>::max(), -1},
     {CUOPT_AUGMENTED, &pdlp_settings.augmented, -1, 1, -1},
     {CUOPT_FOLDING, &pdlp_settings.folding, -1, 1, -1},
