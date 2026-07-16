@@ -11,6 +11,8 @@
 #include <optional>
 #include <vector>
 
+#include <rmm/device_uvector.hpp>
+
 #include <cuopt/mathematical_optimization/optimization_problem.hpp>
 
 #include <PSLP/PSLP_API.h>
@@ -95,6 +97,8 @@ class third_party_presolve_t {
   const std::vector<i_t>& get_reduced_to_original_map() const { return reduced_to_original_map_; }
   const std::vector<i_t>& get_original_to_reduced_map() const { return original_to_reduced_map_; }
 
+  cuopt::mathematical_optimization::presolver_t get_actual_presolver() const { return presolver_; }
+
   const std::vector<f_t>& get_original_objective_coefficients() const
   {
     return original_objective_coefficients_;
@@ -131,7 +135,7 @@ class third_party_presolve_t {
   // cuPSLP settings and state (opaque void* to avoid including cupslp.h in this header)
   void* cupslp_stgs_{nullptr};
   void* cupslp_presolver_{nullptr};
-  void* cupslp_d_persistent_{nullptr};
+  std::optional<rmm::device_uvector<char>> cupslp_d_persistent_buf_{};
   // Original host CSR needed by gpu_postsolve
   std::vector<double> cupslp_h_orig_Ax_;
   std::vector<int> cupslp_h_orig_Ai_;

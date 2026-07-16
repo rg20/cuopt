@@ -46,6 +46,8 @@
 
 #include <raft/core/nvtx.hpp>
 
+#include <rmm/device_uvector.hpp>
+
 #include <algorithm>
 #include <unordered_map>
 
@@ -761,95 +763,113 @@ third_party_presolve_result_t<i_t, f_t> third_party_presolve_t<i_t, f_t>::apply_
     const i_t nnz              = op_problem.get_nnz();
     double original_obj_offset = op_problem.get_objective_offset();
 
-    auto stream_view         = op_problem.get_handle_ptr()->get_stream();
-    const auto& coefficients = op_problem.get_constraint_matrix_values();
-    const auto& offsets      = op_problem.get_constraint_matrix_offsets();
-    const auto& variables    = op_problem.get_constraint_matrix_indices();
-    const auto& obj_coeffs   = op_problem.get_objective_coefficients();
-    const auto& var_lb       = op_problem.get_variable_lower_bounds();
-    const auto& var_ub       = op_problem.get_variable_upper_bounds();
-    const auto& bounds       = op_problem.get_constraint_bounds();
-    const auto& row_types    = op_problem.get_row_types();
-    const auto& constr_lb    = op_problem.get_constraint_lower_bounds();
-    const auto& constr_ub    = op_problem.get_constraint_upper_bounds();
+    auto handle_ptr            = op_problem.get_handle_ptr();
+    auto stream_view           = handle_ptr->get_stream();
+    const auto& coefficients   = op_problem.get_constraint_matrix_values();
+    const auto& offsets        = op_problem.get_constraint_matrix_offsets();
+    const auto& variables      = op_problem.get_constraint_matrix_indices();
+    const auto& obj_coeffs     = op_problem.get_objective_coefficients();
+    const auto& var_lb         = op_problem.get_variable_lower_bounds();
+    const auto& var_ub         = op_problem.get_variable_upper_bounds();
+    const auto& constr_lb      = op_problem.get_constraint_lower_bounds();
+    const auto& constr_ub      = op_problem.get_constraint_upper_bounds();
 
-    std::vector<f_t> h_coefficients(coefficients.size());
-    raft::copy(h_coefficients.data(), coefficients.data(), coefficients.size(), stream_view);
-    std::vector<i_t> h_offsets(offsets.size());
-    raft::copy(h_offsets.data(), offsets.data(), offsets.size(), stream_view);
-    std::vector<i_t> h_variables(variables.size());
-    raft::copy(h_variables.data(), variables.data(), variables.size(), stream_view);
-    std::vector<f_t> h_obj_coeffs(obj_coeffs.size());
-    raft::copy(h_obj_coeffs.data(), obj_coeffs.data(), obj_coeffs.size(), stream_view);
-    std::vector<f_t> h_var_lb(var_lb.size());
-    raft::copy(h_var_lb.data(), var_lb.data(), var_lb.size(), stream_view);
-    std::vector<f_t> h_var_ub(var_ub.size());
-    raft::copy(h_var_ub.data(), var_ub.data(), var_ub.size(), stream_view);
-    std::vector<f_t> h_bounds(bounds.size());
-    raft::copy(h_bounds.data(), bounds.data(), bounds.size(), stream_view);
-    std::vector<char> h_row_types(row_types.size());
-    raft::copy(h_row_types.data(), row_types.data(), row_types.size(), stream_view);
-    std::vector<f_t> h_constr_lb(constr_lb.size());
-    raft::copy(h_constr_lb.data(), constr_lb.data(), constr_lb.size(), stream_view);
-    std::vector<f_t> h_constr_ub(constr_ub.size());
-    raft::copy(h_constr_ub.data(), constr_ub.data(), constr_ub.size(), stream_view);
-    stream_view.synchronize();
+    // --- Matrix: already device-resident, pass pointers directly ---
+    const double* d_Ax = coefficients.data();
+    const int*    d_Ai = reinterpret_cast<const int*>(variables.data());
+    const int*    d_Ap = reinterpret_cast<const int*>(offsets.data());
 
-    if (maximize_) {
-      for (size_t i = 0; i < h_obj_coeffs.size(); ++i) {
-        h_obj_coeffs[i] = -h_obj_coeffs[i];
-      }
-    }
+    // --- Postsolve needs the original CSR on host; async D→H ---
+    cupslp_h_orig_Ax_.resize(nnz);
+    cupslp_h_orig_Ai_.resize(nnz);
+    cupslp_h_orig_Ap_.resize(num_rows + 1);
+    raft::copy(cupslp_h_orig_Ax_.data(), coefficients.data(), nnz, stream_view);
+    raft::copy(cupslp_h_orig_Ai_.data(), variables.data(), nnz, stream_view);
+    raft::copy(cupslp_h_orig_Ap_.data(), offsets.data(), num_rows + 1, stream_view);
 
-    auto constr_bounds_empty = h_constr_lb.empty() && h_constr_ub.empty();
-    if (constr_bounds_empty) {
+    // --- Constraint bounds ---
+    // If already set on device use them directly; otherwise build from row_types on host then H→D.
+    rmm::device_uvector<double> owned_lhs(0, stream_view);
+    rmm::device_uvector<double> owned_rhs(0, stream_view);
+    const double* d_lhs;
+    const double* d_rhs;
+
+    if (!constr_lb.is_empty() && !constr_ub.is_empty()) {
+      d_lhs = constr_lb.data();
+      d_rhs = constr_ub.data();
+    } else {
+      const auto& bounds    = op_problem.get_constraint_bounds();
+      const auto& row_types = op_problem.get_row_types();
+      std::vector<f_t> h_bounds(bounds.size());
+      std::vector<char> h_row_types(row_types.size());
+      raft::copy(h_bounds.data(), bounds.data(), bounds.size(), stream_view);
+      raft::copy(h_row_types.data(), row_types.data(), row_types.size(), stream_view);
+      stream_view.synchronize();
+
+      std::vector<double> h_lhs, h_rhs;
+      h_lhs.reserve(num_rows);
+      h_rhs.reserve(num_rows);
       for (size_t i = 0; i < h_row_types.size(); ++i) {
         if (h_row_types[i] == 'L') {
-          h_constr_lb.push_back(-std::numeric_limits<f_t>::infinity());
-          h_constr_ub.push_back(h_bounds[i]);
+          h_lhs.push_back(-std::numeric_limits<double>::infinity());
+          h_rhs.push_back(h_bounds[i]);
         } else if (h_row_types[i] == 'G') {
-          h_constr_lb.push_back(h_bounds[i]);
-          h_constr_ub.push_back(std::numeric_limits<f_t>::infinity());
-        } else if (h_row_types[i] == 'E') {
-          h_constr_lb.push_back(h_bounds[i]);
-          h_constr_ub.push_back(h_bounds[i]);
+          h_lhs.push_back(h_bounds[i]);
+          h_rhs.push_back(std::numeric_limits<double>::infinity());
+        } else {
+          h_lhs.push_back(h_bounds[i]);
+          h_rhs.push_back(h_bounds[i]);
         }
       }
+      owned_lhs = rmm::device_uvector<double>(num_rows, stream_view);
+      owned_rhs = rmm::device_uvector<double>(num_rows, stream_view);
+      raft::copy(owned_lhs.data(), h_lhs.data(), num_rows, stream_view);
+      raft::copy(owned_rhs.data(), h_rhs.data(), num_rows, stream_view);
+      d_lhs = owned_lhs.data();
+      d_rhs = owned_rhs.data();
     }
-    if (h_var_lb.empty()) {
-      h_var_lb = std::vector<f_t>(num_cols, -std::numeric_limits<f_t>::infinity());
+
+    // --- Variable bounds ---
+    rmm::device_uvector<double> owned_lbs(0, stream_view);
+    rmm::device_uvector<double> owned_ubs(0, stream_view);
+    const double* d_lbs;
+    const double* d_ubs;
+
+    if (!var_lb.is_empty()) {
+      d_lbs = var_lb.data();
+      d_ubs = var_ub.data();
+    } else {
+      std::vector<double> h_lbs(num_cols, -std::numeric_limits<double>::infinity());
+      std::vector<double> h_ubs(num_cols, std::numeric_limits<double>::infinity());
+      owned_lbs = rmm::device_uvector<double>(num_cols, stream_view);
+      owned_ubs = rmm::device_uvector<double>(num_cols, stream_view);
+      raft::copy(owned_lbs.data(), h_lbs.data(), num_cols, stream_view);
+      raft::copy(owned_ubs.data(), h_ubs.data(), num_cols, stream_view);
+      d_lbs = owned_lbs.data();
+      d_ubs = owned_ubs.data();
     }
-    if (h_var_ub.empty()) {
-      h_var_ub = std::vector<f_t>(num_cols, std::numeric_limits<f_t>::infinity());
+
+    // --- Objective: negate on host if maximizing, then copy to device ---
+    rmm::device_uvector<double> owned_c(0, stream_view);
+    const double* d_c;
+
+    if (!maximize_) {
+      d_c = obj_coeffs.data();
+    } else {
+      std::vector<double> h_obj(num_cols);
+      raft::copy(h_obj.data(), obj_coeffs.data(), num_cols, stream_view);
+      stream_view.synchronize();
+      for (auto& v : h_obj) v = -v;
+      owned_c = rmm::device_uvector<double>(num_cols, stream_view);
+      raft::copy(owned_c.data(), h_obj.data(), num_cols, stream_view);
+      d_c = owned_c.data();
     }
 
-    // Store original host CSR for gpu_postsolve
-    cupslp_h_orig_Ax_.assign(h_coefficients.begin(), h_coefficients.end());
-    cupslp_h_orig_Ai_.assign(h_variables.begin(), h_variables.end());
-    cupslp_h_orig_Ap_.assign(h_offsets.begin(), h_offsets.end());
+    // Sync so the async D→H postsolve copies and any thrust ops are done before cuPSLP reads.
+    // cuPSLP does not accept a stream, so it uses the device's default stream.
+    stream_view.synchronize();
 
-    // Stage preprocessed problem to device
-    double *d_Ax, *d_lhs, *d_rhs, *d_lbs, *d_ubs, *d_c;
-    int *d_Ai, *d_Ap;
-    cudaMalloc(&d_Ax, nnz * sizeof(double));
-    cudaMalloc(&d_Ai, nnz * sizeof(int));
-    cudaMalloc(&d_Ap, (num_rows + 1) * sizeof(int));
-    cudaMalloc(&d_lhs, num_rows * sizeof(double));
-    cudaMalloc(&d_rhs, num_rows * sizeof(double));
-    cudaMalloc(&d_lbs, num_cols * sizeof(double));
-    cudaMalloc(&d_ubs, num_cols * sizeof(double));
-    cudaMalloc(&d_c, num_cols * sizeof(double));
-
-    cudaMemcpy(d_Ax, h_coefficients.data(), nnz * sizeof(double), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_Ai, h_variables.data(), nnz * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_Ap, h_offsets.data(), (num_rows + 1) * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_lhs, h_constr_lb.data(), num_rows * sizeof(double), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_rhs, h_constr_ub.data(), num_rows * sizeof(double), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_lbs, h_var_lb.data(), num_cols * sizeof(double), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_ubs, h_var_ub.data(), num_cols * sizeof(double), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_c, h_obj_coeffs.data(), num_cols * sizeof(double), cudaMemcpyHostToDevice);
-
-    // Free previous cuPSLP state
+    // --- Free previous cuPSLP state ---
     if (cupslp_presolver_ != nullptr) {
       gpu_free_presolver(static_cast<GpuPresolver*>(cupslp_presolver_));
       cupslp_presolver_ = nullptr;
@@ -858,32 +878,23 @@ third_party_presolve_result_t<i_t, f_t> third_party_presolve_t<i_t, f_t>::apply_
       gpu_free_settings(static_cast<GpuSettings*>(cupslp_stgs_));
       cupslp_stgs_ = nullptr;
     }
-    if (cupslp_d_persistent_ != nullptr) {
-      cudaFree(cupslp_d_persistent_);
-      cupslp_d_persistent_ = nullptr;
-    }
-
     GpuSettings* stgs = gpu_default_settings();
     stgs->verbose     = false;
     stgs->max_time    = time_limit;
     cupslp_stgs_      = stgs;
 
-    size_t pbytes = gpu_presolver_persistent_buffer_size(num_rows, num_cols, nnz, stgs);
-    size_t tbytes = gpu_presolver_transient_buffer_size(num_rows, num_cols, nnz, stgs);
-    // cudaMalloc(_, 0) may return NULL on some platforms; cuPSLP rejects NULL buffers.
-    if (pbytes == 0) pbytes = 256;
-    if (tbytes == 0) tbytes = 256;
+    size_t pbytes =
+      std::max(gpu_presolver_persistent_buffer_size(num_rows, num_cols, nnz, stgs), size_t{256});
+    size_t tbytes =
+      std::max(gpu_presolver_transient_buffer_size(num_rows, num_cols, nnz, stgs), size_t{256});
 
-    cuopt_expects(cudaMalloc(&cupslp_d_persistent_, pbytes) == cudaSuccess,
-                  error_type_t::RuntimeError,
-                  "cuPSLP: cudaMalloc failed for persistent buffer");
-    void* d_transient = nullptr;
-    cuopt_expects(cudaMalloc(&d_transient, tbytes) == cudaSuccess,
-                  error_type_t::RuntimeError,
-                  "cuPSLP: cudaMalloc failed for transient buffer");
+    // Assigning frees the old persistent buffer and allocates the new one via RMM.
+    cupslp_d_persistent_buf_ = rmm::device_uvector<char>(pbytes, stream_view);
+    // Transient buffer freed automatically at end of scope (after gpu_run_presolver).
+    rmm::device_uvector<char> d_transient_buf(tbytes, stream_view);
 
-    auto start_time   = std::chrono::high_resolution_clock::now();
-    GpuPresolver* gp  = gpu_new_presolver_device_buffer(d_Ax,
+    auto start_time  = std::chrono::high_resolution_clock::now();
+    GpuPresolver* gp = gpu_new_presolver_device_buffer(d_Ax,
                                                        d_Ai,
                                                        d_Ap,
                                                        static_cast<size_t>(num_rows),
@@ -894,9 +905,9 @@ third_party_presolve_result_t<i_t, f_t> third_party_presolve_t<i_t, f_t>::apply_
                                                        d_lbs,
                                                        d_ubs,
                                                        d_c,
-                                                       cupslp_d_persistent_,
+                                                       cupslp_d_persistent_buf_.value().data(),
                                                        pbytes,
-                                                       d_transient,
+                                                       d_transient_buf.data(),
                                                        tbytes,
                                                        stgs);
     cupslp_presolver_ = gp;
@@ -905,18 +916,7 @@ third_party_presolve_result_t<i_t, f_t> third_party_presolve_t<i_t, f_t>::apply_
       gp != nullptr, error_type_t::RuntimeError, "cuPSLP presolver initialization failed");
 
     auto gpu_status = gpu_run_presolver(gp);
-
-    // Free staging and transient allocations only after gpu_run_presolver —
-    // the library reads the input CSR and uses the transient buffer during the run.
-    cudaFree(d_transient);
-    cudaFree(d_Ax);
-    cudaFree(d_Ai);
-    cudaFree(d_Ap);
-    cudaFree(d_lhs);
-    cudaFree(d_rhs);
-    cudaFree(d_lbs);
-    cudaFree(d_ubs);
-    cudaFree(d_c);
+    // owned_lhs/rhs/lbs/ubs/c and d_transient_buf freed here by RAII (after run completes).
 
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
@@ -1014,6 +1014,22 @@ third_party_presolve_result_t<i_t, f_t> third_party_presolve_t<i_t, f_t>::apply(
   }
 
   if (presolver == cuopt::mathematical_optimization::presolver_t::cuPSLP) {
+    int device_id = 0;
+    cudaDeviceProp device_prop{};
+    bool sm_supported = false;
+    if (cudaGetDevice(&device_id) == cudaSuccess &&
+        cudaGetDeviceProperties(&device_prop, device_id) == cudaSuccess) {
+      // cuPSLP requires sm_75 (Turing) or later
+      sm_supported = (device_prop.major > 7) || (device_prop.major == 7 && device_prop.minor >= 5);
+    }
+    if (!sm_supported) {
+      CUOPT_LOG_WARN(
+        "cuPSLP presolver requires sm_75 or later (detected sm_%d%d); falling back to PSLP",
+        device_prop.major,
+        device_prop.minor);
+      presolver_ = cuopt::mathematical_optimization::presolver_t::PSLP;
+      return apply_pslp(op_problem, time_limit);
+    }
     return apply_cupslp(op_problem, time_limit);
   }
 
@@ -1494,7 +1510,7 @@ third_party_presolve_t<i_t, f_t>::~third_party_presolve_t()
     gpu_free_presolver(static_cast<GpuPresolver*>(cupslp_presolver_));
   }
   if (cupslp_stgs_ != nullptr) { gpu_free_settings(static_cast<GpuSettings*>(cupslp_stgs_)); }
-  if (cupslp_d_persistent_ != nullptr) { cudaFree(cupslp_d_persistent_); }
+  // cupslp_d_persistent_buf_ freed automatically by rmm::device_uvector destructor.
 }
 
 template <typename f_t>

@@ -1982,7 +1982,9 @@ optimization_problem_solution_t<i_t, f_t> solve_lp(
         CUOPT_LOG_INFO("Presolve completely solved the problem");
         presolve_time = lp_timer.elapsed_time();
         CUOPT_LOG_INFO("%s presolve time: %.2fs",
-                       settings.presolver == presolver_t::PSLP ? "PSLP" : "Papilo",
+                       presolver->get_actual_presolver() == presolver_t::PSLP     ? "PSLP"
+                     : presolver->get_actual_presolver() == presolver_t::cuPSLP ? "cuPSLP"
+                                                                                : "Papilo",
                        presolve_time);
 
         // Create empty solution vectors for the reduced problem
@@ -2029,7 +2031,9 @@ optimization_problem_solution_t<i_t, f_t> solve_lp(
       problem       = mip::problem_t<i_t, f_t>(result->reduced_problem);
       presolve_time = lp_timer.elapsed_time();
       CUOPT_LOG_INFO("%s presolve time: %.2fs",
-                     settings.presolver == presolver_t::PSLP ? "PSLP" : "Papilo",
+                     presolver->get_actual_presolver() == presolver_t::PSLP     ? "PSLP"
+                     : presolver->get_actual_presolver() == presolver_t::cuPSLP ? "cuPSLP"
+                                                                                : "Papilo",
                      presolve_time);
     }
 
