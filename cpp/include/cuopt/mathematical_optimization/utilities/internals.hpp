@@ -139,7 +139,8 @@ enum presolver_t : int {
   Default = CUOPT_PRESOLVE_DEFAULT,
   None    = CUOPT_PRESOLVE_OFF,
   Papilo  = CUOPT_PRESOLVE_PAPILO,
-  PSLP    = CUOPT_PRESOLVE_PSLP
+  PSLP    = CUOPT_PRESOLVE_PSLP,
+  cuPSLP  = CUOPT_PRESOLVE_CUPSLP
 };
 
 }  // namespace mathematical_optimization

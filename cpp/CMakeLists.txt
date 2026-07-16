@@ -532,6 +532,14 @@ target_include_directories(cuopt SYSTEM PRIVATE
   "${dejavu_SOURCE_DIR}"
 )
 
+# cuPSLP - GPU presolver (prebuilt binary from local distribution)
+set(CUPSLP_DIST_DIR "$ENV{HOME}/git-repos/cuPSLP-distribution" CACHE PATH
+    "Path to the cuPSLP prebuilt distribution directory (contains include/ and libcupslp.so.0)")
+target_include_directories(cuopt SYSTEM PRIVATE "${CUPSLP_DIST_DIR}/include")
+target_link_libraries(cuopt PRIVATE "${CUPSLP_DIST_DIR}/libcupslp.so.0")
+set_property(TARGET cuopt APPEND PROPERTY INSTALL_RPATH "${CUPSLP_DIST_DIR}")
+set_property(TARGET cuopt APPEND PROPERTY BUILD_RPATH   "${CUPSLP_DIST_DIR}")
+
 target_include_directories(cuopt
         PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty"

@@ -40,7 +40,7 @@ void map_proto_to_pdlp_settings(const cuopt::remote::PDLPSolverSettings& pb_sett
   // guard the int64 -> i_t conversion of iteration_limit against overflow.
   {
     auto pv = pb_settings.presolver();
-    if (pv < CUOPT_PRESOLVE_DEFAULT || pv > CUOPT_PRESOLVE_PSLP) {
+    if (pv < CUOPT_PRESOLVE_DEFAULT || pv > CUOPT_PRESOLVE_CUPSLP) {
       settings.presolver = presolver_t::Default;
     }
   }
@@ -72,7 +72,7 @@ void map_proto_to_mip_settings(const cuopt::remote::MIPSolverSettings& pb_settin
   // from buggy/untrusted encoders to safe defaults.
   {
     auto pv = pb_settings.presolver();
-    if (pv < CUOPT_PRESOLVE_DEFAULT || pv > CUOPT_PRESOLVE_PSLP) {
+    if (pv < CUOPT_PRESOLVE_DEFAULT || pv > CUOPT_PRESOLVE_CUPSLP) {
       settings.presolver = presolver_t::Default;
     }
   }

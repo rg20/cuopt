@@ -113,12 +113,29 @@ class third_party_presolve_t {
                  rmm::device_uvector<f_t>& reduced_costs,
                  rmm::cuda_stream_view stream_view);
 
+  third_party_presolve_result_t<i_t, f_t> apply_cupslp(
+    optimization_problem_t<i_t, f_t> const& op_problem, const double time_limit);
+
+  void undo_cupslp(rmm::device_uvector<f_t>& primal_solution,
+                   rmm::device_uvector<f_t>& dual_solution,
+                   rmm::device_uvector<f_t>& reduced_costs,
+                   rmm::cuda_stream_view stream_view);
+
   bool maximize_ = false;
   cuopt::mathematical_optimization::presolver_t presolver_ =
     cuopt::mathematical_optimization::presolver_t::PSLP;
   // PSLP settings
   Settings* pslp_stgs_{nullptr};
   Presolver* pslp_presolver_{nullptr};
+
+  // cuPSLP settings and state (opaque void* to avoid including cupslp.h in this header)
+  void* cupslp_stgs_{nullptr};
+  void* cupslp_presolver_{nullptr};
+  void* cupslp_d_persistent_{nullptr};
+  // Original host CSR needed by gpu_postsolve
+  std::vector<double> cupslp_h_orig_Ax_;
+  std::vector<int> cupslp_h_orig_Ai_;
+  std::vector<int> cupslp_h_orig_Ap_;
 
   // Necessary due to a nvcc bug due to papilo's constexpr functions
   // Keep the papilo includes in the .cpp to avoid bringing them

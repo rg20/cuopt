@@ -17,6 +17,8 @@
 #include <PSLP/PSLP_sol.h>
 #include <PSLP/PSLP_stats.h>
 #include <PSLP/PSLP_status.h>
+#include <cuda_runtime.h>
+#include <cupslp.h>
 #include <cuopt/error.hpp>
 
 #if defined(__clang__)
@@ -534,6 +536,78 @@ third_party_presolve_status_t convert_pslp_presolve_status_to_third_party_presol
   return third_party_presolve_status_t::UNCHANGED;
 }
 
+third_party_presolve_status_t convert_cupslp_presolve_status_to_third_party_presolve_status(
+  GpuPresolveStatus status)
+{
+  if (status & GPU_INFEASIBLE) {
+    if (status == GPU_UNBNDORINFEAS) return third_party_presolve_status_t::UNBNDORINFEAS;
+    return third_party_presolve_status_t::INFEASIBLE;
+  }
+  if (status & GPU_REDUCED) return third_party_presolve_status_t::REDUCED;
+  return third_party_presolve_status_t::UNCHANGED;
+}
+
+template <typename i_t, typename f_t>
+optimization_problem_t<i_t, f_t> build_optimization_problem_from_cupslp(
+  GpuPresolvedProblem* reduced_prob,
+  raft::handle_t const* handle_ptr,
+  bool maximize,
+  f_t original_obj_offset)
+{
+  raft::common::nvtx::range fun_scope("Build optimization problem from cuPSLP");
+  cuopt_expects(reduced_prob != nullptr,
+                error_type_t::RuntimeError,
+                "cuPSLP presolver reduced problem is null");
+
+  i_t n_rows        = static_cast<i_t>(reduced_prob->m);
+  i_t n_cols        = static_cast<i_t>(reduced_prob->n);
+  i_t nnz           = static_cast<i_t>(reduced_prob->nnz);
+  double obj_offset = reduced_prob->obj_offset;
+
+  optimization_problem_t<i_t, f_t> op_problem(handle_ptr);
+  obj_offset = maximize ? -obj_offset : obj_offset;
+  obj_offset += original_obj_offset;
+  op_problem.set_objective_offset(obj_offset);
+  op_problem.set_maximize(maximize);
+  op_problem.set_problem_category(problem_category_t::LP);
+
+  if (n_cols == 0 && n_rows == 0) {
+    std::vector<i_t> empty_offsets = {0};
+    op_problem.set_csr_constraint_matrix(nullptr, 0, nullptr, 0, empty_offsets.data(), 1);
+    return op_problem;
+  }
+
+  auto stream_view = handle_ptr->get_stream();
+  std::vector<f_t> h_Ax(nnz), h_lhs(n_rows), h_rhs(n_rows), h_c(n_cols);
+  std::vector<f_t> h_lbs(n_cols), h_ubs(n_cols);
+  std::vector<i_t> h_Ai(nnz), h_Ap(n_rows + 1);
+
+  raft::copy(h_Ax.data(), reduced_prob->Ax, nnz, stream_view);
+  raft::copy(h_Ai.data(), reduced_prob->Ai, nnz, stream_view);
+  raft::copy(h_Ap.data(), reduced_prob->Ap, n_rows + 1, stream_view);
+  raft::copy(h_lhs.data(), reduced_prob->lhs, n_rows, stream_view);
+  raft::copy(h_rhs.data(), reduced_prob->rhs, n_rows, stream_view);
+  raft::copy(h_c.data(), reduced_prob->c, n_cols, stream_view);
+  raft::copy(h_lbs.data(), reduced_prob->lbs, n_cols, stream_view);
+  raft::copy(h_ubs.data(), reduced_prob->ubs, n_cols, stream_view);
+  stream_view.synchronize();
+
+  if (maximize) {
+    for (i_t i = 0; i < n_cols; ++i) {
+      h_c[i] = -h_c[i];
+    }
+  }
+
+  op_problem.set_csr_constraint_matrix(h_Ax.data(), nnz, h_Ai.data(), nnz, h_Ap.data(), n_rows + 1);
+  op_problem.set_objective_coefficients(h_c.data(), n_cols);
+  op_problem.set_constraint_lower_bounds(h_lhs.data(), n_rows);
+  op_problem.set_constraint_upper_bounds(h_rhs.data(), n_rows);
+  op_problem.set_variable_lower_bounds(h_lbs.data(), n_cols);
+  op_problem.set_variable_upper_bounds(h_ubs.data(), n_cols);
+
+  return op_problem;
+}
+
 void check_postsolve_status(const papilo::PostsolveStatus& status)
 {
   switch (status) {
@@ -667,6 +741,251 @@ third_party_presolve_result_t<i_t, f_t> third_party_presolve_t<i_t, f_t>::apply_
 }
 
 template <typename i_t, typename f_t>
+third_party_presolve_result_t<i_t, f_t> third_party_presolve_t<i_t, f_t>::apply_cupslp(
+  optimization_problem_t<i_t, f_t> const& op_problem, const double time_limit)
+{
+  if constexpr (!std::is_same_v<f_t, double>) {
+    cuopt_expects(
+      false, error_type_t::ValidationError, "cuPSLP presolver only supports double precision");
+    return third_party_presolve_result_t<i_t, f_t>{
+      third_party_presolve_status_t::UNCHANGED,
+      optimization_problem_t<i_t, f_t>(op_problem.get_handle_ptr()),
+      {},
+      {},
+      {}};
+  } else {
+    raft::common::nvtx::range fun_scope("Build and run cuPSLP presolver");
+
+    const i_t num_cols         = op_problem.get_n_variables();
+    const i_t num_rows         = op_problem.get_n_constraints();
+    const i_t nnz              = op_problem.get_nnz();
+    double original_obj_offset = op_problem.get_objective_offset();
+
+    auto stream_view         = op_problem.get_handle_ptr()->get_stream();
+    const auto& coefficients = op_problem.get_constraint_matrix_values();
+    const auto& offsets      = op_problem.get_constraint_matrix_offsets();
+    const auto& variables    = op_problem.get_constraint_matrix_indices();
+    const auto& obj_coeffs   = op_problem.get_objective_coefficients();
+    const auto& var_lb       = op_problem.get_variable_lower_bounds();
+    const auto& var_ub       = op_problem.get_variable_upper_bounds();
+    const auto& bounds       = op_problem.get_constraint_bounds();
+    const auto& row_types    = op_problem.get_row_types();
+    const auto& constr_lb    = op_problem.get_constraint_lower_bounds();
+    const auto& constr_ub    = op_problem.get_constraint_upper_bounds();
+
+    std::vector<f_t> h_coefficients(coefficients.size());
+    raft::copy(h_coefficients.data(), coefficients.data(), coefficients.size(), stream_view);
+    std::vector<i_t> h_offsets(offsets.size());
+    raft::copy(h_offsets.data(), offsets.data(), offsets.size(), stream_view);
+    std::vector<i_t> h_variables(variables.size());
+    raft::copy(h_variables.data(), variables.data(), variables.size(), stream_view);
+    std::vector<f_t> h_obj_coeffs(obj_coeffs.size());
+    raft::copy(h_obj_coeffs.data(), obj_coeffs.data(), obj_coeffs.size(), stream_view);
+    std::vector<f_t> h_var_lb(var_lb.size());
+    raft::copy(h_var_lb.data(), var_lb.data(), var_lb.size(), stream_view);
+    std::vector<f_t> h_var_ub(var_ub.size());
+    raft::copy(h_var_ub.data(), var_ub.data(), var_ub.size(), stream_view);
+    std::vector<f_t> h_bounds(bounds.size());
+    raft::copy(h_bounds.data(), bounds.data(), bounds.size(), stream_view);
+    std::vector<char> h_row_types(row_types.size());
+    raft::copy(h_row_types.data(), row_types.data(), row_types.size(), stream_view);
+    std::vector<f_t> h_constr_lb(constr_lb.size());
+    raft::copy(h_constr_lb.data(), constr_lb.data(), constr_lb.size(), stream_view);
+    std::vector<f_t> h_constr_ub(constr_ub.size());
+    raft::copy(h_constr_ub.data(), constr_ub.data(), constr_ub.size(), stream_view);
+    stream_view.synchronize();
+
+    if (maximize_) {
+      for (size_t i = 0; i < h_obj_coeffs.size(); ++i) {
+        h_obj_coeffs[i] = -h_obj_coeffs[i];
+      }
+    }
+
+    auto constr_bounds_empty = h_constr_lb.empty() && h_constr_ub.empty();
+    if (constr_bounds_empty) {
+      for (size_t i = 0; i < h_row_types.size(); ++i) {
+        if (h_row_types[i] == 'L') {
+          h_constr_lb.push_back(-std::numeric_limits<f_t>::infinity());
+          h_constr_ub.push_back(h_bounds[i]);
+        } else if (h_row_types[i] == 'G') {
+          h_constr_lb.push_back(h_bounds[i]);
+          h_constr_ub.push_back(std::numeric_limits<f_t>::infinity());
+        } else if (h_row_types[i] == 'E') {
+          h_constr_lb.push_back(h_bounds[i]);
+          h_constr_ub.push_back(h_bounds[i]);
+        }
+      }
+    }
+    if (h_var_lb.empty()) {
+      h_var_lb = std::vector<f_t>(num_cols, -std::numeric_limits<f_t>::infinity());
+    }
+    if (h_var_ub.empty()) {
+      h_var_ub = std::vector<f_t>(num_cols, std::numeric_limits<f_t>::infinity());
+    }
+
+    // Store original host CSR for gpu_postsolve
+    cupslp_h_orig_Ax_.assign(h_coefficients.begin(), h_coefficients.end());
+    cupslp_h_orig_Ai_.assign(h_variables.begin(), h_variables.end());
+    cupslp_h_orig_Ap_.assign(h_offsets.begin(), h_offsets.end());
+
+    // Stage preprocessed problem to device
+    double *d_Ax, *d_lhs, *d_rhs, *d_lbs, *d_ubs, *d_c;
+    int *d_Ai, *d_Ap;
+    cudaMalloc(&d_Ax, nnz * sizeof(double));
+    cudaMalloc(&d_Ai, nnz * sizeof(int));
+    cudaMalloc(&d_Ap, (num_rows + 1) * sizeof(int));
+    cudaMalloc(&d_lhs, num_rows * sizeof(double));
+    cudaMalloc(&d_rhs, num_rows * sizeof(double));
+    cudaMalloc(&d_lbs, num_cols * sizeof(double));
+    cudaMalloc(&d_ubs, num_cols * sizeof(double));
+    cudaMalloc(&d_c, num_cols * sizeof(double));
+
+    cudaMemcpy(d_Ax, h_coefficients.data(), nnz * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_Ai, h_variables.data(), nnz * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_Ap, h_offsets.data(), (num_rows + 1) * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_lhs, h_constr_lb.data(), num_rows * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_rhs, h_constr_ub.data(), num_rows * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_lbs, h_var_lb.data(), num_cols * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ubs, h_var_ub.data(), num_cols * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_c, h_obj_coeffs.data(), num_cols * sizeof(double), cudaMemcpyHostToDevice);
+
+    // Free previous cuPSLP state
+    if (cupslp_presolver_ != nullptr) {
+      gpu_free_presolver(static_cast<GpuPresolver*>(cupslp_presolver_));
+      cupslp_presolver_ = nullptr;
+    }
+    if (cupslp_stgs_ != nullptr) {
+      gpu_free_settings(static_cast<GpuSettings*>(cupslp_stgs_));
+      cupslp_stgs_ = nullptr;
+    }
+    if (cupslp_d_persistent_ != nullptr) {
+      cudaFree(cupslp_d_persistent_);
+      cupslp_d_persistent_ = nullptr;
+    }
+
+    GpuSettings* stgs = gpu_default_settings();
+    stgs->verbose     = false;
+    stgs->max_time    = time_limit;
+    cupslp_stgs_      = stgs;
+
+    size_t pbytes = gpu_presolver_persistent_buffer_size(num_rows, num_cols, nnz, stgs);
+    size_t tbytes = gpu_presolver_transient_buffer_size(num_rows, num_cols, nnz, stgs);
+    // cudaMalloc(_, 0) may return NULL on some platforms; cuPSLP rejects NULL buffers.
+    if (pbytes == 0) pbytes = 256;
+    if (tbytes == 0) tbytes = 256;
+
+    cuopt_expects(cudaMalloc(&cupslp_d_persistent_, pbytes) == cudaSuccess,
+                  error_type_t::RuntimeError,
+                  "cuPSLP: cudaMalloc failed for persistent buffer");
+    void* d_transient = nullptr;
+    cuopt_expects(cudaMalloc(&d_transient, tbytes) == cudaSuccess,
+                  error_type_t::RuntimeError,
+                  "cuPSLP: cudaMalloc failed for transient buffer");
+
+    auto start_time   = std::chrono::high_resolution_clock::now();
+    GpuPresolver* gp  = gpu_new_presolver_device_buffer(d_Ax,
+                                                       d_Ai,
+                                                       d_Ap,
+                                                       static_cast<size_t>(num_rows),
+                                                       static_cast<size_t>(num_cols),
+                                                       static_cast<size_t>(nnz),
+                                                       d_lhs,
+                                                       d_rhs,
+                                                       d_lbs,
+                                                       d_ubs,
+                                                       d_c,
+                                                       cupslp_d_persistent_,
+                                                       pbytes,
+                                                       d_transient,
+                                                       tbytes,
+                                                       stgs);
+    cupslp_presolver_ = gp;
+
+    cuopt_expects(
+      gp != nullptr, error_type_t::RuntimeError, "cuPSLP presolver initialization failed");
+
+    auto gpu_status = gpu_run_presolver(gp);
+
+    // Free staging and transient allocations only after gpu_run_presolver —
+    // the library reads the input CSR and uses the transient buffer during the run.
+    cudaFree(d_transient);
+    cudaFree(d_Ax);
+    cudaFree(d_Ai);
+    cudaFree(d_Ap);
+    cudaFree(d_lhs);
+    cudaFree(d_rhs);
+    cudaFree(d_lbs);
+    cudaFree(d_ubs);
+    cudaFree(d_c);
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    CUOPT_LOG_DEBUG("cuPSLP presolver time: %d milliseconds", duration.count());
+
+    cuopt_expects(!(gpu_status & (GPU_OUT_OF_MEMORY | GPU_POSTSOLVE_OVERFLOW)),
+                  error_type_t::RuntimeError,
+                  "cuPSLP presolver failed: out of memory or postsolve log overflow");
+
+    auto status = convert_cupslp_presolve_status_to_third_party_presolve_status(gpu_status);
+
+    if (gpu_status & GPU_INFEASIBLE) {
+      optimization_problem_t<i_t, f_t> empty_problem(op_problem.get_handle_ptr());
+      return third_party_presolve_result_t<i_t, f_t>{status, std::move(empty_problem), {}, {}, {}};
+    }
+
+    auto* stats = gp->stats;
+    CUOPT_LOG_INFO("cuPSLP presolved: %zu constraints, %zu variables, %zu non-zeros",
+                   stats->n_rows_reduced,
+                   stats->n_cols_reduced,
+                   stats->nnz_reduced);
+
+    auto opt_problem = build_optimization_problem_from_cupslp<i_t, f_t>(
+      gp->reduced_prob, op_problem.get_handle_ptr(), maximize_, original_obj_offset);
+    return third_party_presolve_result_t<i_t, f_t>{status, std::move(opt_problem), {}, {}, {}};
+  }
+}
+
+template <typename i_t, typename f_t>
+void third_party_presolve_t<i_t, f_t>::undo_cupslp(rmm::device_uvector<f_t>& primal_solution,
+                                                   rmm::device_uvector<f_t>& dual_solution,
+                                                   rmm::device_uvector<f_t>& reduced_costs,
+                                                   rmm::cuda_stream_view stream_view)
+{
+  if constexpr (std::is_same_v<f_t, double>) {
+    std::vector<double> h_primal(primal_solution.size());
+    std::vector<double> h_dual(dual_solution.size());
+    std::vector<double> h_rc(reduced_costs.size());
+    raft::copy(h_primal.data(), primal_solution.data(), primal_solution.size(), stream_view);
+    raft::copy(h_dual.data(), dual_solution.data(), dual_solution.size(), stream_view);
+    raft::copy(h_rc.data(), reduced_costs.data(), reduced_costs.size(), stream_view);
+    stream_view.synchronize();
+
+    auto* gp = static_cast<GpuPresolver*>(cupslp_presolver_);
+    gpu_postsolve(gp,
+                  h_primal.data(),
+                  h_dual.data(),
+                  h_rc.data(),
+                  cupslp_h_orig_Ax_.data(),
+                  cupslp_h_orig_Ai_.data(),
+                  cupslp_h_orig_Ap_.data());
+
+    auto* sol     = gp->sol;
+    size_t n_cols = sol->dim_x;
+    size_t n_rows = sol->dim_y;
+    primal_solution.resize(n_cols, stream_view);
+    dual_solution.resize(n_rows, stream_view);
+    reduced_costs.resize(n_cols, stream_view);
+    raft::copy(primal_solution.data(), sol->x, n_cols, stream_view);
+    raft::copy(dual_solution.data(), sol->y, n_rows, stream_view);
+    raft::copy(reduced_costs.data(), sol->z, n_cols, stream_view);
+  } else {
+    cuopt_expects(
+      false, error_type_t::ValidationError, "cuPSLP postsolve only supports double precision");
+  }
+  stream_view.synchronize();
+}
+
+template <typename i_t, typename f_t>
 third_party_presolve_result_t<i_t, f_t> third_party_presolve_t<i_t, f_t>::apply(
   optimization_problem_t<i_t, f_t> const& op_problem,
   problem_category_t category,
@@ -684,9 +1003,18 @@ third_party_presolve_result_t<i_t, f_t> third_party_presolve_t<i_t, f_t>::apply(
     cuopt_expects(
       false, error_type_t::RuntimeError, "PSLP presolver is not supported for MIP problems");
   }
+  if (category == problem_category_t::MIP &&
+      presolver == cuopt::mathematical_optimization::presolver_t::cuPSLP) {
+    cuopt_expects(
+      false, error_type_t::RuntimeError, "cuPSLP presolver is not supported for MIP problems");
+  }
 
   if (presolver == cuopt::mathematical_optimization::presolver_t::PSLP) {
     return apply_pslp(op_problem, time_limit);
+  }
+
+  if (presolver == cuopt::mathematical_optimization::presolver_t::cuPSLP) {
+    return apply_cupslp(op_problem, time_limit);
   }
 
   original_objective_coefficients_   = op_problem.get_objective_coefficients_host();
@@ -793,6 +1121,11 @@ void third_party_presolve_t<i_t, f_t>::undo(rmm::device_uvector<f_t>& primal_sol
     return;
   }
 
+  if (presolver_ == cuopt::mathematical_optimization::presolver_t::cuPSLP) {
+    undo_cupslp(primal_solution, dual_solution, reduced_costs, stream_view);
+    return;
+  }
+
   if (status_to_skip) { return; }
 
   std::vector<f_t> primal_sol_vec_h(primal_solution.size());
@@ -869,7 +1202,8 @@ template <typename i_t, typename f_t>
 void third_party_presolve_t<i_t, f_t>::uncrush_primal_solution(
   const std::vector<f_t>& reduced_primal, std::vector<f_t>& full_primal) const
 {
-  if (presolver_ == cuopt::mathematical_optimization::presolver_t::PSLP) {
+  if (presolver_ == cuopt::mathematical_optimization::presolver_t::PSLP ||
+      presolver_ == cuopt::mathematical_optimization::presolver_t::cuPSLP) {
     cuopt_expects(false,
                   error_type_t::RuntimeError,
                   "This code path should be never called, as this is meant for callbacks and they "
@@ -1156,6 +1490,11 @@ third_party_presolve_t<i_t, f_t>::~third_party_presolve_t()
 {
   if (pslp_presolver_ != nullptr) { free_presolver(pslp_presolver_); }
   if (pslp_stgs_ != nullptr) { free_settings(pslp_stgs_); }
+  if (cupslp_presolver_ != nullptr) {
+    gpu_free_presolver(static_cast<GpuPresolver*>(cupslp_presolver_));
+  }
+  if (cupslp_stgs_ != nullptr) { gpu_free_settings(static_cast<GpuSettings*>(cupslp_stgs_)); }
+  if (cupslp_d_persistent_ != nullptr) { cudaFree(cupslp_d_persistent_); }
 }
 
 template <typename f_t>

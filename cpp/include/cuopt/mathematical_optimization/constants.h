@@ -205,6 +205,7 @@
 #define CUOPT_PRESOLVE_OFF     0
 #define CUOPT_PRESOLVE_PAPILO  1
 #define CUOPT_PRESOLVE_PSLP    2
+#define CUOPT_PRESOLVE_CUPSLP  3
 
 /* @brief MIP scaling mode constants */
 #define CUOPT_MIP_SCALING_OFF          0
