@@ -763,21 +763,21 @@ third_party_presolve_result_t<i_t, f_t> third_party_presolve_t<i_t, f_t>::apply_
     const i_t nnz              = op_problem.get_nnz();
     double original_obj_offset = op_problem.get_objective_offset();
 
-    auto handle_ptr            = op_problem.get_handle_ptr();
-    auto stream_view           = handle_ptr->get_stream();
-    const auto& coefficients   = op_problem.get_constraint_matrix_values();
-    const auto& offsets        = op_problem.get_constraint_matrix_offsets();
-    const auto& variables      = op_problem.get_constraint_matrix_indices();
-    const auto& obj_coeffs     = op_problem.get_objective_coefficients();
-    const auto& var_lb         = op_problem.get_variable_lower_bounds();
-    const auto& var_ub         = op_problem.get_variable_upper_bounds();
-    const auto& constr_lb      = op_problem.get_constraint_lower_bounds();
-    const auto& constr_ub      = op_problem.get_constraint_upper_bounds();
+    auto handle_ptr          = op_problem.get_handle_ptr();
+    auto stream_view         = handle_ptr->get_stream();
+    const auto& coefficients = op_problem.get_constraint_matrix_values();
+    const auto& offsets      = op_problem.get_constraint_matrix_offsets();
+    const auto& variables    = op_problem.get_constraint_matrix_indices();
+    const auto& obj_coeffs   = op_problem.get_objective_coefficients();
+    const auto& var_lb       = op_problem.get_variable_lower_bounds();
+    const auto& var_ub       = op_problem.get_variable_upper_bounds();
+    const auto& constr_lb    = op_problem.get_constraint_lower_bounds();
+    const auto& constr_ub    = op_problem.get_constraint_upper_bounds();
 
     // --- Matrix: already device-resident, pass pointers directly ---
     const double* d_Ax = coefficients.data();
-    const int*    d_Ai = reinterpret_cast<const int*>(variables.data());
-    const int*    d_Ap = reinterpret_cast<const int*>(offsets.data());
+    const int* d_Ai    = reinterpret_cast<const int*>(variables.data());
+    const int* d_Ap    = reinterpret_cast<const int*>(offsets.data());
 
     // --- Postsolve needs the original CSR on host; async D→H ---
     cupslp_h_orig_Ax_.resize(nnz);
@@ -859,7 +859,8 @@ third_party_presolve_result_t<i_t, f_t> third_party_presolve_t<i_t, f_t>::apply_
       std::vector<double> h_obj(num_cols);
       raft::copy(h_obj.data(), obj_coeffs.data(), num_cols, stream_view);
       stream_view.synchronize();
-      for (auto& v : h_obj) v = -v;
+      for (auto& v : h_obj)
+        v = -v;
       owned_c = rmm::device_uvector<double>(num_cols, stream_view);
       raft::copy(owned_c.data(), h_obj.data(), num_cols, stream_view);
       d_c = owned_c.data();
@@ -893,8 +894,8 @@ third_party_presolve_result_t<i_t, f_t> third_party_presolve_t<i_t, f_t>::apply_
     // Transient buffer freed automatically at end of scope (after gpu_run_presolver).
     rmm::device_uvector<char> d_transient_buf(tbytes, stream_view);
 
-    auto start_time  = std::chrono::high_resolution_clock::now();
-    GpuPresolver* gp = gpu_new_presolver_device_buffer(d_Ax,
+    auto start_time   = std::chrono::high_resolution_clock::now();
+    GpuPresolver* gp  = gpu_new_presolver_device_buffer(d_Ax,
                                                        d_Ai,
                                                        d_Ap,
                                                        static_cast<size_t>(num_rows),
