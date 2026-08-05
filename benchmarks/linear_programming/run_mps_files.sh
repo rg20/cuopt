@@ -228,11 +228,11 @@ TIME_LIMIT=${TIME_LIMIT:-360}
 OUTPUT_DIR=${OUTPUT_DIR:-.}
 RELAXATION=${RELAXATION:-false}
 MIP_HEURISTICS_ONLY=${MIP_HEURISTICS_ONLY:-false}
-WRITE_LOG_FILE=${WRITE_LOG_FILE:-false}
+WRITE_LOG_FILE=${WRITE_LOG_FILE:-true}
 NUM_CPU_THREADS=${NUM_CPU_THREADS:--1}
 BATCH_NUM=${BATCH_NUM:-0}
 N_BATCHES=${N_BATCHES:-1}
-LOG_TO_CONSOLE=${LOG_TO_CONSOLE:-true}
+LOG_TO_CONSOLE=${LOG_TO_CONSOLE:-false}
 MODEL_LIST=${MODEL_LIST:-}
 PDLP_TOLERANCES=${PDLP_TOLERANCES:-1e-4}
 RECURSIVE=${RECURSIVE:-false}
@@ -458,7 +458,7 @@ worker() {
             args="$args --absolute-primal-tolerance $PDLP_TOLERANCES --absolute-dual-tolerance $PDLP_TOLERANCES --relative-primal-tolerance $PDLP_TOLERANCES --relative-dual-tolerance $PDLP_TOLERANCES --absolute-gap-tolerance $PDLP_TOLERANCES --relative-gap-tolerance $PDLP_TOLERANCES"
         fi
 
-        CUDA_VISIBLE_DEVICES=$gpu_devices cuopt_cli "$mps_file" --time-limit $TIME_LIMIT $args
+        CUDA_VISIBLE_DEVICES=$gpu_devices cuopt_cli "$mps_file" --time-limit $TIME_LIMIT $args 
     done
 }
 
