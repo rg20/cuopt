@@ -58,7 +58,7 @@ template <typename i_t, typename f_t, typename T>
 f_t iterative_refinement_simple(T& op,
                                 const rmm::device_uvector<f_t>& b,
                                 rmm::device_uvector<f_t>& x,
-                                f_t tol = 1e-8)
+                                f_t tol)
 {
   rmm::device_uvector<f_t> x_sav(x, x.stream());
 
@@ -125,14 +125,14 @@ template <typename i_t, typename f_t, typename T>
 f_t iterative_refinement_gmres(T& op,
                                const rmm::device_uvector<f_t>& b,
                                rmm::device_uvector<f_t>& x,
-                               f_t tol = 1e-8)
+                               f_t tol)
 {
   // Parameters
   // Ideally, we do not need to restart here. But having restarts helps as a checkpoint to get
   // better solutions in case of true residual is far from the measured residual and true residuals
   // are not converging after some point
-  const int max_restarts = 3;
-  const int m            = 10;  // Krylov space dimension
+  const int max_restarts = 6;
+  const int m            = 20;  // Krylov space dimension
 
   rmm::device_uvector<f_t> r(x.size(), x.stream());
   rmm::device_uvector<f_t> x_sav(x, x.stream());
@@ -365,7 +365,7 @@ template <typename i_t, typename f_t, typename T>
 f_t iterative_refinement(T& op,
                          const dense_vector_t<i_t, f_t>& b,
                          dense_vector_t<i_t, f_t>& x,
-                         f_t tol = 1e-8)
+                         f_t tol)
 {
   rmm::device_uvector<f_t> d_b(b.size(), op.data_.handle_ptr->get_stream());
   raft::copy(d_b.data(), b.data(), b.size(), op.data_.handle_ptr->get_stream());
