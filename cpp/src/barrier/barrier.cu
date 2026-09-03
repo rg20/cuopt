@@ -4633,9 +4633,19 @@ lp_status_t barrier_solver_t<i_t, f_t>::solve(f_t start_time, lp_solution_t<i_t,
 
       compute_final_direction(data);
       f_t step_primal, step_dual;
-      compute_primal_dual_step_length(data, settings.barrier_step_scale, step_primal, step_dual);
+      // Adaptive fraction-to-boundary: near the optimum (small mu) the iterate hugs the
+      // boundary and a fixed, conservative step (e.g. 0.9) only makes slow tail-end
+      // progress -- exactly the "many iterations, each shrinking the gap only slightly"
+      // pattern seen once the barrier parameter has shrunk after a well-conditioned
+      // solve path is established. Let the step scale grow toward the standard IPM
+      // fraction-to-boundary cap of 0.9995 as mu shrinks; early on (mu large) it stays
+      // at settings.barrier_step_scale, so problems that already converge cleanly keep
+      // their existing trajectory.
+      const f_t adaptive_step_scale = std::max(
+        settings.barrier_step_scale, std::min(f_t(0.9995), f_t(1.0) - std::min(f_t(0.1), mu)));
+      compute_primal_dual_step_length(data, adaptive_step_scale, step_primal, step_dual);
 
-      compute_next_iterate(data, settings.barrier_step_scale, step_primal, step_dual);
+      compute_next_iterate(data, adaptive_step_scale, step_primal, step_dual);
 
       compute_residual_norms_mu_and_objective(data,
                                               primal_residual_norm,
