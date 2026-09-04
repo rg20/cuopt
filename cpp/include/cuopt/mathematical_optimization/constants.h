@@ -214,9 +214,11 @@
 #define CUOPT_METHOD_UNSET        4
 
 
-/* @brief Dual simplex pricing strategy parameter and constants */
+/* @brief Dual simplex pricing: -1 automatic (start steepest-edge, may switch to Devex),
+ *        0 steepest-edge (default), 1 Devex, 2 max infeasibility */
 #define CUOPT_DUAL_SIMPLEX_PRICING "dual_simplex_pricing"
 
+#define CUOPT_DUAL_SIMPLEX_PRICING_AUTOMATIC         -1
 #define CUOPT_DUAL_SIMPLEX_PRICING_STEEPEST_EDGE     0
 #define CUOPT_DUAL_SIMPLEX_PRICING_DEVEX             1
 #define CUOPT_DUAL_SIMPLEX_PRICING_MAX_INFEASIBILITY 2

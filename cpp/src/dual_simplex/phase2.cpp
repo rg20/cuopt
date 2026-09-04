@@ -2680,6 +2680,82 @@ class phase2_timers_t {
   bool record_time;
 };
 
+// One-way DSE -> Devex switch when pricing is AUTOMATIC.
+constexpr double k_dse_density_ema                                = 0.05;
+constexpr double k_costly_dse_measure_limit                       = 1000.0;
+constexpr double k_costly_dse_minimum_density                     = 0.01;
+constexpr double k_costly_dse_fraction_iters_before_switch        = 0.1;
+constexpr double k_costly_dse_fraction_costly_iters_before_switch = 0.05;
+constexpr double k_dse_weight_log_error_threshold                 = 10.0;
+constexpr double k_dse_weight_error_ema                           = 0.01;
+
+template <typename f_t>
+void update_operation_result_density(f_t local_density, f_t& density)
+{
+  density = (1.0 - k_dse_density_ema) * density + k_dse_density_ema * local_density;
+}
+
+template <typename f_t>
+void assess_dse_weight_error(f_t computed_weight,
+                             f_t updated_weight,
+                             f_t& avg_log_low,
+                             f_t& avg_log_high)
+{
+  constexpr f_t min_weight = 1e-16;
+  computed_weight          = std::max(computed_weight, min_weight);
+  updated_weight           = std::max(updated_weight, min_weight);
+  if (updated_weight < computed_weight) {
+    avg_log_low =
+      (1.0 - k_dse_weight_error_ema) * avg_log_low +
+      k_dse_weight_error_ema * std::log(computed_weight / updated_weight);
+  } else {
+    avg_log_high =
+      (1.0 - k_dse_weight_error_ema) * avg_log_high +
+      k_dse_weight_error_ema * std::log(updated_weight / computed_weight);
+  }
+}
+
+template <typename i_t, typename f_t>
+bool should_switch_dse_to_devex(bool allow_switch,
+                                i_t local_iters,
+                                i_t num_tot,
+                                i_t& num_costly_dse_iteration,
+                                f_t row_ep_density,
+                                f_t col_aq_density,
+                                f_t row_ap_density,
+                                f_t row_dse_density,
+                                f_t avg_log_low,
+                                f_t avg_log_high,
+                                const char*& reason)
+{
+  reason = nullptr;
+  if (!allow_switch) { return false; }
+
+  const f_t denom = std::max(std::max(row_ep_density, col_aq_density), row_ap_density);
+  f_t costly_measure = 0.0;
+  if (denom > 0.0) {
+    const f_t ratio = row_dse_density / denom;
+    costly_measure  = ratio * ratio;
+  }
+  const bool costly_iteration =
+    costly_measure > k_costly_dse_measure_limit && row_dse_density > k_costly_dse_minimum_density;
+  if (costly_iteration) {
+    num_costly_dse_iteration++;
+    if (num_costly_dse_iteration >
+          local_iters * k_costly_dse_fraction_costly_iters_before_switch &&
+        local_iters > k_costly_dse_fraction_iters_before_switch * num_tot) {
+      reason = "costly_dse";
+      return true;
+    }
+  }
+
+  if (avg_log_low + avg_log_high > k_dse_weight_log_error_threshold) {
+    reason = "weight_error";
+    return true;
+  }
+  return false;
+}
+
 }  // namespace phase2
 
 template <typename i_t, typename f_t>
@@ -2875,11 +2951,22 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
 #endif
 
   pricing_strategy_t effective_strategy = settings.pricing_strategy;
+  const bool allow_dse_to_devex_switch  = (effective_strategy == pricing_strategy_t::AUTOMATIC);
+  if (allow_dse_to_devex_switch) { effective_strategy = pricing_strategy_t::STEEPEST_EDGE; }
 
   std::vector<i_t> devex_index(n, 0);
-  i_t num_devex_iterations           = 0;
-  bool pending_devex_framework_reset = false;
-  f_t computed_devex_weight          = 1.0;
+  i_t num_devex_iterations             = 0;
+  bool pending_devex_framework_reset   = false;
+  f_t computed_devex_weight            = 1.0;
+
+  f_t row_ep_density                = 0.0;
+  f_t col_aq_density                = 0.0;
+  f_t row_ap_density                = 0.0;
+  f_t row_dse_density               = 0.0;
+  f_t avg_log_low_dse_weight_error  = 0.0;
+  f_t avg_log_high_dse_weight_error = 0.0;
+  i_t num_costly_dse_iteration      = 0;
+  i_t dse_local_iters               = 0;
 
   if (delta_y_steepest_edge.size() == 0) {
     delta_y_steepest_edge.resize(n);
@@ -3053,6 +3140,7 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
     {
       PHASE2_NVTX_RANGE("DualSimplex::pricing");
       switch (effective_strategy) {
+        case pricing_strategy_t::AUTOMATIC:
         case pricing_strategy_t::STEEPEST_EDGE:
           leaving_index =
             phase2::steepest_edge_pricing_with_infeasibilities(lp,
@@ -3247,6 +3335,12 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
     const f_t steepest_edge_norm_check = delta_y_sparse.norm2_squared();
     phase2_work_estimate += 2 * delta_y_sparse.i.size();
     if (effective_strategy == pricing_strategy_t::STEEPEST_EDGE) {
+      phase2::update_operation_result_density(static_cast<f_t>(delta_y_sparse.i.size()) / m,
+                                              row_ep_density);
+      phase2::assess_dse_weight_error(steepest_edge_norm_check,
+                                      delta_y_steepest_edge[leaving_index],
+                                      avg_log_low_dse_weight_error,
+                                      avg_log_high_dse_weight_error);
       if (delta_y_steepest_edge[leaving_index] <
           settings.steepest_edge_ratio * steepest_edge_norm_check) {
         constexpr bool verbose = false;
@@ -3303,7 +3397,10 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
       }
     }
     timers.delta_z_time += timers.stop_timer();
-    if (effective_strategy == pricing_strategy_t::DEVEX) {
+    if (effective_strategy == pricing_strategy_t::STEEPEST_EDGE) {
+      phase2::update_operation_result_density(static_cast<f_t>(delta_z_indices.size()) / n,
+                                              row_ap_density);
+    } else if (effective_strategy == pricing_strategy_t::DEVEX) {
       computed_devex_weight = phase2::compute_devex_weight(
         delta_z_indices, delta_z, devex_index, basic_mark);
     }
@@ -3646,6 +3743,10 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
     }
     solve_work += (ft.work_estimate() - ftran_start_work);
     timers.ftran_time += timers.stop_timer();
+    if (effective_strategy == pricing_strategy_t::STEEPEST_EDGE) {
+      phase2::update_operation_result_density(
+        static_cast<f_t>(scaled_delta_xB_sparse.i.size()) / m, col_aq_density);
+    }
     if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
       return dual_status_t::CONCURRENT_LIMIT;
     }
@@ -3690,6 +3791,39 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
                                                                 v_sparse,
                                                                 delta_y_steepest_edge,
                                                                 phase2_work_estimate);
+      phase2::update_operation_result_density(static_cast<f_t>(v_sparse.i.size()) / m,
+                                              row_dse_density);
+      dse_local_iters++;
+      const char* switch_reason = nullptr;
+      if (phase2::should_switch_dse_to_devex(allow_dse_to_devex_switch,
+                                             dse_local_iters,
+                                             n,
+                                             num_costly_dse_iteration,
+                                             row_ep_density,
+                                             col_aq_density,
+                                             row_ap_density,
+                                             row_dse_density,
+                                             avg_log_low_dse_weight_error,
+                                             avg_log_high_dse_weight_error,
+                                             switch_reason)) {
+        phase2::initialise_devex_framework(
+          basic_list, nonbasic_list, delta_y_steepest_edge, devex_index);
+        num_devex_iterations          = 0;
+        pending_devex_framework_reset = false;
+        effective_strategy            = pricing_strategy_t::DEVEX;
+        settings.log.printf(
+          "Switch DSE to Devex at iter %d reason=%s costly=%d local_iters=%d "
+          "densities ep=%.4g aq=%.4g ap=%.4g dse=%.4g log_err=%.4g\n",
+          iter,
+          switch_reason,
+          num_costly_dse_iteration,
+          dse_local_iters,
+          row_ep_density,
+          col_aq_density,
+          row_ap_density,
+          row_dse_density,
+          avg_log_low_dse_weight_error + avg_log_high_dse_weight_error);
+      }
     }
     // For MAX_INFEASIBILITY, no weight update is needed
 

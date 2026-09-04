@@ -29,9 +29,10 @@ struct benchmark_info_t;
 namespace cuopt::mathematical_optimization::simplex {
 
 enum class pricing_strategy_t {
-  STEEPEST_EDGE     = 0,  // Exact steepest edge (default, most iterations saved but expensive init)
-  DEVEX             = 1,  // Devex approximate steepest edge (cheaper init, good performance)
-  MAX_INFEASIBILITY = 2   // Simple max infeasibility (fastest per iteration, most iterations)
+  AUTOMATIC         = -1,  // Start steepest-edge; one-way fallback to Devex
+  STEEPEST_EDGE     = 0,   // Exact steepest edge (default, most iterations saved but expensive init)
+  DEVEX             = 1,   // Devex approximate steepest edge (cheaper init, good performance)
+  MAX_INFEASIBILITY = 2    // Simple max infeasibility (fastest per iteration, most iterations)
 };
 
 template <typename i_t, typename f_t>
@@ -166,7 +167,7 @@ struct simplex_solver_settings_t {
   bool use_steepest_edge_pricing;  // true if using steepest edge pricing, false if using max
                                    // infeasibility pricing (deprecated, use pricing_strategy)
   pricing_strategy_t
-    pricing_strategy;         // Pricing strategy: STEEPEST_EDGE, DEVEX, or MAX_INFEASIBILITY
+    pricing_strategy;  // Pricing strategy: AUTOMATIC, STEEPEST_EDGE, DEVEX, or MAX_INFEASIBILITY
   i_t devex_reset_frequency;  // Unused; Devex resets on weight-ratio or iteration count
   bool use_harris_ratio;      // true if using the harris ratio test
   bool use_bound_flip_ratio;  // true if using the bound flip ratio test

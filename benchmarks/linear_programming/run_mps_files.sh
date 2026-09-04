@@ -77,7 +77,7 @@ Optional Arguments:
     --log-to-console   Log to console
     --model-list       File containing a list of models to run
     --pdlp-tolerances  Tolerances for PDLP solver (default: 1e-4)
-    --dual-simplex-pricing N  Dual simplex pricing: 0 steepest-edge, 1 Devex, 2 max-infeasibility
+    --dual-simplex-pricing N  Dual simplex pricing: -1 automatic, 0 steepest-edge, 1 Devex, 2 max-infeasibility
     --recursive        Recursively search for .mps/.MPS/.SIF files under --path
     --cut-mode MODE    Cut family configuration: default, no-cuts, flow-cover-only
     -h, --help         Show this help message and exit
@@ -272,8 +272,12 @@ fi
 if command -v nvidia-smi &> /dev/null; then
     AVAILABLE_GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
     if [[ "$GPU_COUNT" -gt "$AVAILABLE_GPU_COUNT" ]]; then
-        echo "Error: Requested --ngpus $GPU_COUNT, but only $AVAILABLE_GPU_COUNT GPU(s) available according to nvidia-smi."
-        exit 1
+        echo "Warning: Requested --ngpus $GPU_COUNT, but only $AVAILABLE_GPU_COUNT GPU(s) available."
+        echo "Cycling GPU IDs to launch $GPU_COUNT processes (CPU dual simplex still uses one process per worker)."
+        GPU_LIST=()
+        for ((i=0; i<GPU_COUNT; i++)); do
+            GPU_LIST+=("$((i % AVAILABLE_GPU_COUNT))")
+        done
     fi
 fi
 

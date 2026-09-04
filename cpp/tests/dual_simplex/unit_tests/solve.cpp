@@ -89,6 +89,14 @@ TEST(dual_simplex, chess_set)
   EXPECT_NEAR(solution.x[0], 0.0, 1e-6);
   EXPECT_NEAR(solution.x[1], 66.6667, 1e-3);
 
+  EXPECT_EQ(settings.pricing_strategy, simplex::pricing_strategy_t::STEEPEST_EDGE);
+  settings.pricing_strategy = simplex::pricing_strategy_t::AUTOMATIC;
+  simplex::lp_solution_t<int, double> automatic_solution(user_problem.num_rows,
+                                                         user_problem.num_cols);
+  EXPECT_EQ((simplex::solve_linear_program(user_problem, settings, automatic_solution)),
+            simplex::lp_status_t::OPTIMAL);
+  EXPECT_NEAR(-automatic_solution.objective, 1333.33, 1e-2);
+
   user_problem.var_types[0] = simplex::variable_type_t::INTEGER;
   user_problem.var_types[1] = simplex::variable_type_t::INTEGER;
 
