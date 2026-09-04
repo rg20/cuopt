@@ -77,6 +77,7 @@ Optional Arguments:
     --log-to-console   Log to console
     --model-list       File containing a list of models to run
     --pdlp-tolerances  Tolerances for PDLP solver (default: 1e-4)
+    --dual-simplex-pricing N  Dual simplex pricing: 0 steepest-edge, 1 Devex, 2 max-infeasibility
     --recursive        Recursively search for .mps/.MPS/.SIF files under --path
     --cut-mode MODE    Cut family configuration: default, no-cuts, flow-cover-only
     -h, --help         Show this help message and exit
@@ -195,6 +196,11 @@ while [[ $# -gt 0 ]]; do
         --pdlp-tolerances)
             echo "PDLP_TOLERANCES: $2"
             PDLP_TOLERANCES="$2"
+            shift 2
+            ;;
+        --dual-simplex-pricing)
+            echo "DUAL_SIMPLEX_PRICING: $2"
+            DUAL_SIMPLEX_PRICING="$2"
             shift 2
             ;;
         --recursive)
@@ -448,6 +454,9 @@ worker() {
         fi
         if [ -n "$METHOD" ]; then
             args="$args --method $METHOD"
+        fi
+        if [ -n "$DUAL_SIMPLEX_PRICING" ]; then
+            args="$args --dual-simplex-pricing $DUAL_SIMPLEX_PRICING"
         fi
         if [ "$CUT_MODE" = "no-cuts" ]; then
             args="$args --mip-mixed-integer-rounding-cuts 0 --mip-mixed-integer-gomory-cuts 0 --mip-knapsack-cuts 0 --mip-flow-cover-cuts 0 --mip-clique-cuts 0 --mip-implied-bound-cuts 0 --mip-strong-chvatal-gomory-cuts 0 --mip-reduced-cost-strengthening 0"

@@ -1077,39 +1077,71 @@ i_t phase2_pricing(const lp_problem_t<i_t, f_t>& lp,
 // ============================================================================
 // Devex Pricing Implementation
 // ============================================================================
-// Devex (Harris, 1973) is an approximate steepest edge method that maintains
-// reference weights which approximate the squared norms of B^{-T} e_i.
-// It is cheaper to initialize and update than exact steepest edge.
+// Dual Devex (Harris 1973 / Huangfu-Hall):
+// reference set = basics at framework init; exact weight is the squared
+// pivotal-row residual over that set; weights update from the pivot column.
 
-template <typename i_t, typename f_t>
-void initialize_devex_weights(const std::vector<i_t>& basic_list,
-                              const std::vector<i_t>& nonbasic_list,
-                              std::vector<f_t>& devex_weights)
+template <typename i_t>
+void set_devex_index_from_basis(const std::vector<i_t>& basic_list,
+                                const std::vector<i_t>& nonbasic_list,
+                                std::vector<i_t>& devex_index)
 {
+  std::fill(devex_index.begin(), devex_index.end(), 0);
   const i_t m = basic_list.size();
-  const i_t n = devex_weights.size();
-
-  // Initialize all weights to 1.0 (the Devex reference framework)
   for (i_t k = 0; k < m; ++k) {
-    const i_t j      = basic_list[k];
-    devex_weights[j] = 1.0;
+    devex_index[basic_list[k]] = 1;
   }
-  const i_t n_minus_m = n - m;
+  const i_t n_minus_m = static_cast<i_t>(nonbasic_list.size());
   for (i_t k = 0; k < n_minus_m; ++k) {
-    const i_t j      = nonbasic_list[k];
-    devex_weights[j] = 1e-4;  // Small weight for nonbasic variables
+    devex_index[nonbasic_list[k]] = 0;
   }
 }
 
 template <typename i_t, typename f_t>
-void reset_devex_reference_framework(const std::vector<i_t>& basic_list,
-                                     std::vector<f_t>& devex_weights)
+void initialise_devex_framework(const std::vector<i_t>& basic_list,
+                                const std::vector<i_t>& nonbasic_list,
+                                std::vector<f_t>& devex_weights,
+                                std::vector<i_t>& devex_index)
 {
+  set_devex_index_from_basis(basic_list, nonbasic_list, devex_index);
   const i_t m = basic_list.size();
   for (i_t k = 0; k < m; ++k) {
-    const i_t j      = basic_list[k];
-    devex_weights[j] = 1.0;
+    devex_weights[basic_list[k]] = 1.0;
   }
+}
+
+template <typename i_t, typename f_t>
+f_t compute_devex_weight(const std::vector<i_t>& delta_z_indices,
+                         const std::vector<f_t>& delta_z,
+                         const std::vector<i_t>& devex_index,
+                         const std::vector<i_t>& basic_mark)
+{
+  f_t computed = 0.0;
+  const i_t nz = delta_z_indices.size();
+  for (i_t k = 0; k < nz; ++k) {
+    const i_t j = delta_z_indices[k];
+    if (basic_mark[j] >= 0) { continue; }
+    if (devex_index[j] == 0) { continue; }
+    const f_t pv = delta_z[j];
+    computed += pv * pv;
+  }
+  return std::max(static_cast<f_t>(1.0), computed);
+}
+
+template <typename i_t, typename f_t>
+bool new_devex_framework_needed(f_t updated_weight,
+                                f_t computed_weight,
+                                i_t num_devex_iterations,
+                                i_t num_rows)
+{
+  constexpr f_t k_max_devex_weight_ratio = 3.0;
+  constexpr i_t k_min_abs_devex_iters    = 25;
+  const f_t computed                     = std::max(computed_weight, static_cast<f_t>(1e-16));
+  const f_t updated                      = std::max(updated_weight, static_cast<f_t>(1e-16));
+  const f_t ratio                        = std::max(updated / computed, computed / updated);
+  const i_t i_te = std::max(k_min_abs_devex_iters, static_cast<i_t>(num_rows / 0.01));
+  return ratio > k_max_devex_weight_ratio * k_max_devex_weight_ratio ||
+         num_devex_iterations > i_te;
 }
 
 template <typename i_t, typename f_t>
@@ -1199,48 +1231,29 @@ void update_devex_weights(const std::vector<i_t>& basic_list,
                           const sparse_vector_t<i_t, f_t>& scaled_delta_xB,
                           i_t basic_leaving_index,
                           i_t entering_index,
+                          f_t computed_edge_weight,
                           std::vector<f_t>& devex_weights,
                           f_t& work_estimate)
 {
-  // Devex update formula (Harris 1973):
-  // Let w = B^{-1} * a_q be the pivot column (stored in scaled_delta_xB as -w)
-  // w_r = pivot element (row of leaving variable)
-  //
-  // For the entering variable: d_q = max(1, ||w||^2 / w_r^2)
-  // For other basic variables: d_j = max(d_j, w_j^2 * d_q / w_r^2)
-
+  // Weight update:
+  //   new_wt = max(1, computed / alpha^2)
+  //   d_i    = max(d_i, new_wt * a_bar_iq^2)
+  //   d_enter = new_wt
   const i_t scaled_delta_xB_nz = scaled_delta_xB.i.size();
-
-  // Find pivot element w_r (negated in scaled_delta_xB)
-  const f_t wr = -scaled_delta_xB.find_coefficient(basic_leaving_index);
+  const f_t alpha              = -scaled_delta_xB.find_coefficient(basic_leaving_index);
   work_estimate += scaled_delta_xB_nz;
+  if (std::abs(alpha) < 1e-12) { return; }
 
-  if (std::abs(wr) < 1e-12) { return; }
+  f_t new_pivotal_weight = computed_edge_weight / (alpha * alpha);
+  new_pivotal_weight     = std::max(static_cast<f_t>(1.0), new_pivotal_weight);
+  devex_weights[entering_index] = new_pivotal_weight;
 
-  const f_t wr_squared = wr * wr;
-
-  // Compute ||w||^2
-  f_t w_norm_squared = 0.0;
-  for (i_t h = 0; h < scaled_delta_xB_nz; ++h) {
-    const f_t w_k = scaled_delta_xB.x[h];
-    w_norm_squared += w_k * w_k;
-  }
-  work_estimate += 2 * scaled_delta_xB_nz;
-
-  // d_q = max(1, ||w||^2 / w_r^2) for the entering variable
-  const f_t d_q                 = std::max(1.0, w_norm_squared / wr_squared);
-  devex_weights[entering_index] = d_q;
-
-  // Update weights for other basic variables
   for (i_t h = 0; h < scaled_delta_xB_nz; ++h) {
     const i_t k = scaled_delta_xB.i[h];
     if (k == basic_leaving_index) { continue; }
-
-    const i_t j       = basic_list[k];
-    const f_t w_k     = -scaled_delta_xB.x[h];  // Negate to get actual w
-    const f_t w_k_sq  = w_k * w_k;
-    const f_t new_val = std::max(devex_weights[j], w_k_sq * d_q / wr_squared);
-    devex_weights[j]  = new_val;
+    const i_t j  = basic_list[k];
+    const f_t aa = scaled_delta_xB.x[h];
+    devex_weights[j] = std::max(devex_weights[j], new_pivotal_weight * aa * aa);
   }
   work_estimate += 4 * scaled_delta_xB_nz;
 }
@@ -2861,17 +2874,21 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
   }
 #endif
 
+  pricing_strategy_t effective_strategy = settings.pricing_strategy;
+
+  std::vector<i_t> devex_index(n, 0);
+  i_t num_devex_iterations           = 0;
+  bool pending_devex_framework_reset = false;
+  f_t computed_devex_weight          = 1.0;
+
   if (delta_y_steepest_edge.size() == 0) {
     delta_y_steepest_edge.resize(n);
     phase2_work_estimate += n;
 
-    // Determine effective pricing strategy from settings
-    pricing_strategy_t effective_strategy = settings.pricing_strategy;
-
     if (effective_strategy == pricing_strategy_t::DEVEX) {
-      // Devex initialization: all weights = 1.0 (very fast)
       PHASE2_NVTX_RANGE("DualSimplex::initialize_devex_weights");
-      phase2::initialize_devex_weights(basic_list, nonbasic_list, delta_y_steepest_edge);
+      phase2::initialise_devex_framework(
+        basic_list, nonbasic_list, delta_y_steepest_edge, devex_index);
       phase2_work_estimate += 2 * n;
       settings.log.printf("Initialized Devex weights\n");
     } else if (slack_basis) {
@@ -2899,6 +2916,9 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
     phase2_work_estimate += 2 * m;
     settings.log.printf("using existing pricing weights %e\n",
                         vector_norm2<i_t, f_t>(delta_y_steepest_edge));
+    if (effective_strategy == pricing_strategy_t::DEVEX) {
+      phase2::set_devex_index_from_basis(basic_list, nonbasic_list, devex_index);
+    }
   }
 
   if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
@@ -3016,6 +3036,14 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
   while (iter < iter_limit) {
     PHASE2_NVTX_RANGE("DualSimplex::phase2_main_loop");
 
+    if (pending_devex_framework_reset && effective_strategy == pricing_strategy_t::DEVEX) {
+      phase2::initialise_devex_framework(
+        basic_list, nonbasic_list, delta_y_steepest_edge, devex_index);
+      num_devex_iterations           = 0;
+      pending_devex_framework_reset  = false;
+      settings.log.printf("Reset Devex reference framework at iteration %d\n", iter);
+    }
+
     // Pricing
     i_t direction           = 0;
     i_t basic_leaving_index = -1;
@@ -3024,7 +3052,7 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
     timers.start_timer();
     {
       PHASE2_NVTX_RANGE("DualSimplex::pricing");
-      switch (settings.pricing_strategy) {
+      switch (effective_strategy) {
         case pricing_strategy_t::STEEPEST_EDGE:
           leaving_index =
             phase2::steepest_edge_pricing_with_infeasibilities(lp,
@@ -3218,19 +3246,21 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
 
     const f_t steepest_edge_norm_check = delta_y_sparse.norm2_squared();
     phase2_work_estimate += 2 * delta_y_sparse.i.size();
-    if (delta_y_steepest_edge[leaving_index] <
-        settings.steepest_edge_ratio * steepest_edge_norm_check) {
-      constexpr bool verbose = false;
-      if constexpr (verbose) {
-        settings.log.printf(
-          "iteration restart due to steepest edge. Leaving %d. Actual %.2e "
-          "from update %.2e\n",
-          leaving_index,
-          steepest_edge_norm_check,
-          delta_y_steepest_edge[leaving_index]);
+    if (effective_strategy == pricing_strategy_t::STEEPEST_EDGE) {
+      if (delta_y_steepest_edge[leaving_index] <
+          settings.steepest_edge_ratio * steepest_edge_norm_check) {
+        constexpr bool verbose = false;
+        if constexpr (verbose) {
+          settings.log.printf(
+            "iteration restart due to steepest edge. Leaving %d. Actual %.2e "
+            "from update %.2e\n",
+            leaving_index,
+            steepest_edge_norm_check,
+            delta_y_steepest_edge[leaving_index]);
+        }
+        delta_y_steepest_edge[leaving_index] = steepest_edge_norm_check;
+        continue;
       }
-      delta_y_steepest_edge[leaving_index] = steepest_edge_norm_check;
-      continue;
     }
 
     timers.start_timer();
@@ -3273,6 +3303,10 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
       }
     }
     timers.delta_z_time += timers.stop_timer();
+    if (effective_strategy == pricing_strategy_t::DEVEX) {
+      computed_devex_weight = phase2::compute_devex_weight(
+        delta_z_indices, delta_z, devex_index, basic_mark);
+    }
     if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
       return dual_status_t::CONCURRENT_LIMIT;
     }
@@ -3627,22 +3661,21 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
     f_t se_norms_start_work = ft.work_estimate();
 
     i_t steepest_edge_status = 0;
-    if (settings.pricing_strategy == pricing_strategy_t::DEVEX) {
-      // Devex update (simpler, no BTRAN solve needed)
-      phase2::update_devex_weights(basic_list,
-                                   scaled_delta_xB_sparse,
-                                   basic_leaving_index,
-                                   entering_index,
-                                   delta_y_steepest_edge,
-                                   phase2_work_estimate);
-
-      // Periodic reset of Devex reference framework
-      if (settings.devex_reset_frequency > 0 &&
-          (iter - start_iter) % settings.devex_reset_frequency == 0 && iter > start_iter) {
-        phase2::reset_devex_reference_framework(basic_list, delta_y_steepest_edge);
-        settings.log.printf("Reset Devex reference framework at iteration %d\n", iter);
+    if (effective_strategy == pricing_strategy_t::DEVEX) {
+      const f_t updated_devex_weight = delta_y_steepest_edge[leaving_index];
+      pending_devex_framework_reset  = phase2::new_devex_framework_needed(
+        updated_devex_weight, computed_devex_weight, num_devex_iterations, m);
+      if (!pending_devex_framework_reset) {
+        phase2::update_devex_weights(basic_list,
+                                     scaled_delta_xB_sparse,
+                                     basic_leaving_index,
+                                     entering_index,
+                                     computed_devex_weight,
+                                     delta_y_steepest_edge,
+                                     phase2_work_estimate);
+        num_devex_iterations++;
       }
-    } else if (settings.pricing_strategy == pricing_strategy_t::STEEPEST_EDGE) {
+    } else if (effective_strategy == pricing_strategy_t::STEEPEST_EDGE) {
       // Full steepest edge update (requires BTRAN solve)
       steepest_edge_status = phase2::update_steepest_edge_norms(settings,
                                                                 basic_list,

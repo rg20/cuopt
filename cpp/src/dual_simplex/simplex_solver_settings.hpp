@@ -167,7 +167,7 @@ struct simplex_solver_settings_t {
                                    // infeasibility pricing (deprecated, use pricing_strategy)
   pricing_strategy_t
     pricing_strategy;         // Pricing strategy: STEEPEST_EDGE, DEVEX, or MAX_INFEASIBILITY
-  i_t devex_reset_frequency;  // Reset Devex reference framework every N iterations (0 = never)
+  i_t devex_reset_frequency;  // Unused; Devex resets on weight-ratio or iteration count
   bool use_harris_ratio;      // true if using the harris ratio test
   bool use_bound_flip_ratio;  // true if using the bound flip ratio test
   bool scale_columns;         // true to scale the columns of A
