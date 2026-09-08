@@ -603,6 +603,10 @@ std::tuple<simplex::lp_solution_t<i_t, f_t>, simplex::lp_status_t, f_t, f_t, f_t
   dual_simplex_settings.time_limit      = settings.time_limit;
   dual_simplex_settings.iteration_limit = settings.iteration_limit;
   dual_simplex_settings.concurrent_halt = settings.concurrent_halt;
+  dual_simplex_settings.pricing_strategy =
+    settings.dual_simplex_pricing == dual_simplex_pricing_t::QuadraticSteepestEdge
+      ? simplex::pricing_strategy_t::QUADRATIC_STEEPEST_EDGE
+      : simplex::pricing_strategy_t::STEEPEST_EDGE;
   if (dual_simplex_settings.concurrent_halt != nullptr) {
     // Don't show the dual simplex log in concurrent mode. Show the PDLP log instead
     dual_simplex_settings.log.log = false;
@@ -857,6 +861,10 @@ optimization_problem_solution_t<i_t, f_t> run_pdlp(mip::problem_t<i_t, f_t>& pro
       dual_simplex_settings.time_limit      = settings.time_limit;
       dual_simplex_settings.iteration_limit = settings.iteration_limit;
       dual_simplex_settings.concurrent_halt = settings.concurrent_halt;
+      dual_simplex_settings.pricing_strategy =
+        settings.dual_simplex_pricing == dual_simplex_pricing_t::QuadraticSteepestEdge
+          ? simplex::pricing_strategy_t::QUADRATIC_STEEPEST_EDGE
+          : simplex::pricing_strategy_t::STEEPEST_EDGE;
       simplex::lp_solution_t<i_t, f_t> vertex_solution(lp.num_rows, lp.num_cols);
       std::vector<simplex::variable_status_t> vstatus(lp.num_cols);
       simplex::crossover_status_t crossover_status = simplex::crossover(lp,

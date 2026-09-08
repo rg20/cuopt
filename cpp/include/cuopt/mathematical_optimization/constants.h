@@ -36,6 +36,7 @@
 #define CUOPT_NODE_LIMIT                            "node_limit"
 #define CUOPT_PDLP_SOLVER_MODE                      "pdlp_solver_mode"
 #define CUOPT_METHOD                                "method"
+#define CUOPT_DUAL_SIMPLEX_PRICING                  "dual_simplex_pricing"
 #define CUOPT_PER_CONSTRAINT_RESIDUAL               "per_constraint_residual"
 #define CUOPT_SAVE_BEST_PRIMAL_SO_FAR               "save_best_primal_so_far"
 #define CUOPT_FIRST_PRIMAL_FEASIBLE                 "first_primal_feasible"
@@ -212,6 +213,10 @@
 #define CUOPT_METHOD_DUAL_SIMPLEX 2
 #define CUOPT_METHOD_BARRIER      3
 #define CUOPT_METHOD_UNSET        4
+
+/* @brief Dual simplex pricing constants */
+#define CUOPT_DUAL_SIMPLEX_PRICING_STEEPEST_EDGE           0
+#define CUOPT_DUAL_SIMPLEX_PRICING_QUADRATIC_STEEPEST_EDGE 1
 
 #define CUOPT_BARRIER_DUAL_INITIAL_POINT_AUTOMATIC             -1
 #define CUOPT_BARRIER_DUAL_INITIAL_POINT_LUSTIG_MARSTEN_SHANNO 0

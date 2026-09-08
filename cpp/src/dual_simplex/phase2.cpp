@@ -1444,15 +1444,8 @@ i_t update_steepest_edge_norms(const simplex_solver_settings_t<i_t, f_t>& settin
                                std::vector<f_t>& delta_y_steepest_edge,
                                f_t& work_estimate)
 {
-  (void)v_sparse;
-  (void)v;
-  (void)ft;
-  (void)direction;
   const i_t delta_y_nz = delta_y_sparse.i.size();
-  work_estimate += delta_y_nz;
-  // Exact DSE would FTRAN v = B^{-1} δy here. That extra solve dominates
-  // iteration cost on this class of LPs. Dropping the cross term
-  // 2 w_k v_k / α keeps the Forrest quadratic update and skips the FTRAN.
+  const bool quadratic = settings.pricing_strategy == pricing_strategy_t::QUADRATIC_STEEPEST_EDGE;
 
   const i_t leaving_index        = basic_list[basic_leaving_index];
   const f_t prev_dy_norm_squared = delta_y_steepest_edge[leaving_index];
@@ -1467,6 +1460,21 @@ i_t update_steepest_edge_norms(const simplex_solver_settings_t<i_t, f_t>& settin
                         prev_dy_norm_squared);
   }
 #endif
+
+  if (!quadratic) {
+    v_sparse.clear();
+    // B^T delta_y = - direction * e_basic_leaving_index
+    // We want B v = -B^{-T} e_basic_leaving_index
+    ft.b_solve(delta_y_sparse, v_sparse);
+    if (direction == -1) {
+      v_sparse.negate();
+      work_estimate += 2 * v_sparse.i.size();
+    }
+    v_sparse.scatter(v);
+    work_estimate += 2 * v_sparse.i.size();
+  } else {
+    work_estimate += delta_y_nz;
+  }
 
   // B*w = A(:, leaving_index)
   // B*scaled_delta_xB = -A(:, leaving_index) so w = -scaled_delta_xB
@@ -1484,9 +1492,10 @@ i_t update_steepest_edge_norms(const simplex_solver_settings_t<i_t, f_t>& settin
       const f_t w_squared                   = w * w;
       delta_y_steepest_edge[entering_index] = (1.0 / w_squared) * dy_norm_squared;
     } else {
-      const f_t wk = -scaled_delta_xB.x[h];
-      f_t new_val  = delta_y_steepest_edge[j] + wk * (wk * omegar);
-      new_val      = std::max(new_val, 1e-4);
+      const f_t wk         = -scaled_delta_xB.x[h];
+      const f_t cross_term = quadratic ? 0.0 : 2.0 * wk * v[k] / wr;
+      f_t new_val          = delta_y_steepest_edge[j] + cross_term + wk * wk * omegar;
+      new_val              = std::max(new_val, 1e-4);
 #ifdef STEEPEST_EDGE_DEBUG
       if (!(new_val >= 0)) {
         settings.log.printf("new val %e\n", new_val);
@@ -1505,6 +1514,14 @@ i_t update_steepest_edge_norms(const simplex_solver_settings_t<i_t, f_t>& settin
     }
   }
   work_estimate += 5 * scaled_delta_xB_nz;
+
+  if (!quadratic) {
+    const i_t v_nz = v_sparse.i.size();
+    for (i_t k = 0; k < v_nz; ++k) {
+      v[v_sparse.i[k]] = 0.0;
+    }
+    work_estimate += 2 * v_nz;
+  }
 
   return 0;
 }
@@ -2712,6 +2729,10 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
   }
 
   if (phase == 2) {
+    settings.log.printf("Dual steepest-edge weight update: %s\n",
+                        settings.pricing_strategy == pricing_strategy_t::QUADRATIC_STEEPEST_EDGE
+                          ? "quadratic"
+                          : "exact");
     settings.log.printf(" Iter     Objective           Num Inf.  Sum Inf.     Perturb  Time\n");
   }
 

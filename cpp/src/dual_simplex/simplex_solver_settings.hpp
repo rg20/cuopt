@@ -28,6 +28,11 @@ struct benchmark_info_t;
 
 namespace cuopt::mathematical_optimization::simplex {
 
+enum class pricing_strategy_t {
+  STEEPEST_EDGE           = 0,
+  QUADRATIC_STEEPEST_EDGE = 1,
+};
+
 template <typename i_t, typename f_t>
 struct simplex_solver_settings_t {
  public:
@@ -58,6 +63,7 @@ struct simplex_solver_settings_t {
       hypersparse_threshold(0.05),
       threshold_partial_pivoting_tol(1.0 / 10.0),
       use_steepest_edge_pricing(true),
+      pricing_strategy(pricing_strategy_t::STEEPEST_EDGE),
       use_harris_ratio(false),
       use_bound_flip_ratio(true),
       scale_columns(true),
@@ -155,12 +161,13 @@ struct simplex_solver_settings_t {
   f_t steepest_edge_primal_tol;  // Primal tolerance divided by steepest edge norm
   f_t hypersparse_threshold;
   mutable f_t threshold_partial_pivoting_tol;
-  bool use_steepest_edge_pricing;  // true if using steepest edge pricing, false if using max
-                                   // infeasibility pricing
-  bool use_harris_ratio;           // true if using the harris ratio test
-  bool use_bound_flip_ratio;       // true if using the bound flip ratio test
-  bool scale_columns;              // true to scale the columns of A
-  bool relaxation;                 // true to only solve the LP relaxation of a MIP
+  bool use_steepest_edge_pricing;       // true if using steepest edge pricing, false if using max
+                                        // infeasibility pricing
+  pricing_strategy_t pricing_strategy;  // exact or quadratic steepest-edge weight update
+  bool use_harris_ratio;                // true if using the harris ratio test
+  bool use_bound_flip_ratio;            // true if using the bound flip ratio test
+  bool scale_columns;                   // true to scale the columns of A
+  bool relaxation;                      // true to only solve the LP relaxation of a MIP
   bool
     use_left_looking_lu;  // true to use left looking LU factorization, false to use right looking
   bool eliminate_singletons;  // true to eliminate singletons from the basis

@@ -80,6 +80,22 @@ TEST(SolverSettingsTest, TestSetGet)
   EXPECT_EQ(solver_settings.barrier_presolve_bound_free_variables, 0);
   solver_settings.barrier_presolve_bound_free_variables = 1;
   EXPECT_EQ(solver_settings.barrier_presolve_bound_free_variables, 1);
+
+  EXPECT_EQ(solver_settings.dual_simplex_pricing, dual_simplex_pricing_t::SteepestEdge);
+  solver_settings.dual_simplex_pricing = dual_simplex_pricing_t::QuadraticSteepestEdge;
+  EXPECT_EQ(solver_settings.dual_simplex_pricing, dual_simplex_pricing_t::QuadraticSteepestEdge);
+}
+
+TEST(SolverSettingsTest, DualSimplexPricingParameter)
+{
+  solver_settings_t<int, double> settings;
+
+  EXPECT_EQ(settings.get_parameter<int>(CUOPT_DUAL_SIMPLEX_PRICING),
+            CUOPT_DUAL_SIMPLEX_PRICING_STEEPEST_EDGE);
+  settings.set_parameter<int>(CUOPT_DUAL_SIMPLEX_PRICING,
+                              CUOPT_DUAL_SIMPLEX_PRICING_QUADRATIC_STEEPEST_EDGE);
+  EXPECT_EQ(settings.get_parameter<int>(CUOPT_DUAL_SIMPLEX_PRICING),
+            CUOPT_DUAL_SIMPLEX_PRICING_QUADRATIC_STEEPEST_EDGE);
 }
 
 TEST(SolverSettingsTest, warm_start_smaller_vector)

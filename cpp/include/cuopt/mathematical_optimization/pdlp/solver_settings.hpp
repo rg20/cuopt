@@ -71,6 +71,20 @@ enum method_t : int {
   Unset       = CUOPT_METHOD_UNSET
 };
 
+/**
+ * @brief Pricing method used by dual simplex.
+ *
+ * SteepestEdge applies the exact DSE weight update. QuadraticSteepestEdge
+ * omits the extra FTRAN and cross term and keeps only the Forrest quadratic
+ * weight update.
+ *
+ * @note Default is SteepestEdge.
+ */
+enum dual_simplex_pricing_t : int {
+  SteepestEdge          = CUOPT_DUAL_SIMPLEX_PRICING_STEEPEST_EDGE,
+  QuadraticSteepestEdge = CUOPT_DUAL_SIMPLEX_PRICING_QUADRATIC_STEEPEST_EDGE
+};
+
 /// Returns the corresponding string from the enum `method_t`.
 inline std::string method_to_string(method_t method)
 {
@@ -347,6 +361,7 @@ class pdlp_solver_settings_t {
   // distributed_pdlp_partitioner_t for the meaning of each value.
   distributed_pdlp_partitioner_t distributed_pdlp_partitioner{distributed_pdlp_partitioner_t::Auto};
   method_t method{method_t::Concurrent};
+  dual_simplex_pricing_t dual_simplex_pricing{dual_simplex_pricing_t::SteepestEdge};
   bool inside_mip{false};
   // For concurrent termination
   std::atomic<int>* concurrent_halt{nullptr};

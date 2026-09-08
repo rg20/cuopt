@@ -20,6 +20,7 @@
 #   --mip-heuristics-only : Run mip heuristics only
 #   --write-log-file : Write log file
 #   --num-cpu-threads : Number of CPU threads to use
+#   --dual-simplex-pricing : Pricing: 0 exact DSE (default), 1 quadratic DSE
 #   --presolve : Enable presolve (default: true for MIP problems, false for LP problems)
 #   --batch-num : Batch number.  This allows to split the work across multiple batches uniformly when resources are limited.
 #   --n-batches : Number of batches
@@ -71,6 +72,8 @@ Optional Arguments:
     --mip-heuristics-only  Run mip heuristics only
     --write-log-file   Write log file
     --num-cpu-threads  Number of CPU threads to use
+    --dual-simplex-pricing MODE
+                        Pricing: 0 exact DSE (default), 1 quadratic DSE
     --presolve         Enable presolve (default: true for MIP problems, false for LP problems)
     --batch-num        Batch number
     --n-batches        Number of batches
@@ -167,6 +170,11 @@ while [[ $# -gt 0 ]]; do
             METHOD="$2"
             shift 2
             ;;
+        --dual-simplex-pricing)
+            echo "DUAL_SIMPLEX_PRICING: $2"
+            DUAL_SIMPLEX_PRICING="$2"
+            shift 2
+            ;;
         --presolve)
             echo "PRESOLVE: $2"
             PRESOLVE="$2"
@@ -235,12 +243,18 @@ N_BATCHES=${N_BATCHES:-1}
 LOG_TO_CONSOLE=${LOG_TO_CONSOLE:-true}
 MODEL_LIST=${MODEL_LIST:-}
 PDLP_TOLERANCES=${PDLP_TOLERANCES:-1e-4}
+DUAL_SIMPLEX_PRICING=${DUAL_SIMPLEX_PRICING:-0}
 RECURSIVE=${RECURSIVE:-false}
 CUT_MODE=${CUT_MODE:-default}
 
 # Validate GPUS_PER_INSTANCE
 if [[ "$GPUS_PER_INSTANCE" != "1" && "$GPUS_PER_INSTANCE" != "2" ]]; then
     echo "Error: --gpus-per-instance must be 1 or 2"
+    exit 1
+fi
+
+if [[ "$DUAL_SIMPLEX_PRICING" != "0" && "$DUAL_SIMPLEX_PRICING" != "1" ]]; then
+    echo "Error: --dual-simplex-pricing must be 0 (exact DSE) or 1 (quadratic DSE)"
     exit 1
 fi
 
@@ -449,6 +463,7 @@ worker() {
         if [ -n "$METHOD" ]; then
             args="$args --method $METHOD"
         fi
+        args="$args --dual-simplex-pricing $DUAL_SIMPLEX_PRICING"
         if [ "$CUT_MODE" = "no-cuts" ]; then
             args="$args --mip-mixed-integer-rounding-cuts 0 --mip-mixed-integer-gomory-cuts 0 --mip-knapsack-cuts 0 --mip-flow-cover-cuts 0 --mip-clique-cuts 0 --mip-implied-bound-cuts 0 --mip-strong-chvatal-gomory-cuts 0 --mip-reduced-cost-strengthening 0"
         elif [ "$CUT_MODE" = "flow-cover-only" ]; then
