@@ -1140,8 +1140,7 @@ bool new_devex_framework_needed(f_t updated_weight,
   const f_t updated                      = std::max(updated_weight, static_cast<f_t>(1e-16));
   const f_t ratio                        = std::max(updated / computed, computed / updated);
   const i_t i_te = std::max(k_min_abs_devex_iters, static_cast<i_t>(num_rows / 0.01));
-  return ratio > k_max_devex_weight_ratio * k_max_devex_weight_ratio ||
-         num_devex_iterations > i_te;
+  return ratio > k_max_devex_weight_ratio * k_max_devex_weight_ratio || num_devex_iterations > i_te;
 }
 
 template <typename i_t, typename f_t>
@@ -1244,15 +1243,15 @@ void update_devex_weights(const std::vector<i_t>& basic_list,
   work_estimate += scaled_delta_xB_nz;
   if (std::abs(alpha) < 1e-12) { return; }
 
-  f_t new_pivotal_weight = computed_edge_weight / (alpha * alpha);
-  new_pivotal_weight     = std::max(static_cast<f_t>(1.0), new_pivotal_weight);
+  f_t new_pivotal_weight        = computed_edge_weight / (alpha * alpha);
+  new_pivotal_weight            = std::max(static_cast<f_t>(1.0), new_pivotal_weight);
   devex_weights[entering_index] = new_pivotal_weight;
 
   for (i_t h = 0; h < scaled_delta_xB_nz; ++h) {
     const i_t k = scaled_delta_xB.i[h];
     if (k == basic_leaving_index) { continue; }
-    const i_t j  = basic_list[k];
-    const f_t aa = scaled_delta_xB.x[h];
+    const i_t j      = basic_list[k];
+    const f_t aa     = scaled_delta_xB.x[h];
     devex_weights[j] = std::max(devex_weights[j], new_pivotal_weight * aa * aa);
   }
   work_estimate += 4 * scaled_delta_xB_nz;
@@ -1633,16 +1632,22 @@ i_t update_steepest_edge_norms(const simplex_solver_settings_t<i_t, f_t>& settin
                                f_t& work_estimate)
 {
   const i_t delta_y_nz = delta_y_sparse.i.size();
-  v_sparse.clear();
-  // B^T delta_y = - direction * e_basic_leaving_index
-  // We want B v =  - B^{-T} e_basic_leaving_index
-  ft.b_solve(delta_y_sparse, v_sparse);
-  if (direction == -1) {
-    v_sparse.negate();
+  const bool quadratic = settings.pricing_strategy == pricing_strategy_t::QUADRATIC_STEEPEST_EDGE;
+
+  if (!quadratic) {
+    v_sparse.clear();
+    // B^T delta_y = - direction * e_basic_leaving_index
+    // We want B v =  - B^{-T} e_basic_leaving_index
+    ft.b_solve(delta_y_sparse, v_sparse);
+    if (direction == -1) {
+      v_sparse.negate();
+      work_estimate += 2 * v_sparse.i.size();
+    }
+    v_sparse.scatter(v);
     work_estimate += 2 * v_sparse.i.size();
+  } else {
+    work_estimate += delta_y_nz;
   }
-  v_sparse.scatter(v);
-  work_estimate += 2 * v_sparse.i.size();
 
   const i_t leaving_index        = basic_list[basic_leaving_index];
   const f_t prev_dy_norm_squared = delta_y_steepest_edge[leaving_index];
@@ -1674,9 +1679,10 @@ i_t update_steepest_edge_norms(const simplex_solver_settings_t<i_t, f_t>& settin
       const f_t w_squared                   = w * w;
       delta_y_steepest_edge[entering_index] = (1.0 / w_squared) * dy_norm_squared;
     } else {
-      const f_t wk = -scaled_delta_xB.x[h];
-      f_t new_val  = delta_y_steepest_edge[j] + wk * (2.0 * v[k] / wr + wk * omegar);
-      new_val      = std::max(new_val, 1e-4);
+      const f_t wk         = -scaled_delta_xB.x[h];
+      const f_t cross_term = quadratic ? 0.0 : 2.0 * v[k] / wr;
+      f_t new_val          = delta_y_steepest_edge[j] + wk * (cross_term + wk * omegar);
+      new_val              = std::max(new_val, 1e-4);
 #ifdef STEEPEST_EDGE_DEBUG
       if (!(new_val >= 0)) {
         settings.log.printf("new val %e\n", new_val);
@@ -1696,11 +1702,13 @@ i_t update_steepest_edge_norms(const simplex_solver_settings_t<i_t, f_t>& settin
   }
   work_estimate += 5 * scaled_delta_xB_nz;
 
-  const i_t v_nz = v_sparse.i.size();
-  for (i_t k = 0; k < v_nz; ++k) {
-    v[v_sparse.i[k]] = 0.0;
+  if (!quadratic) {
+    const i_t v_nz = v_sparse.i.size();
+    for (i_t k = 0; k < v_nz; ++k) {
+      v[v_sparse.i[k]] = 0.0;
+    }
+    work_estimate += 2 * v_nz;
   }
-  work_estimate += 2 * v_nz;
 
   return 0;
 }
@@ -2705,13 +2713,11 @@ void assess_dse_weight_error(f_t computed_weight,
   computed_weight          = std::max(computed_weight, min_weight);
   updated_weight           = std::max(updated_weight, min_weight);
   if (updated_weight < computed_weight) {
-    avg_log_low =
-      (1.0 - k_dse_weight_error_ema) * avg_log_low +
-      k_dse_weight_error_ema * std::log(computed_weight / updated_weight);
+    avg_log_low = (1.0 - k_dse_weight_error_ema) * avg_log_low +
+                  k_dse_weight_error_ema * std::log(computed_weight / updated_weight);
   } else {
-    avg_log_high =
-      (1.0 - k_dse_weight_error_ema) * avg_log_high +
-      k_dse_weight_error_ema * std::log(updated_weight / computed_weight);
+    avg_log_high = (1.0 - k_dse_weight_error_ema) * avg_log_high +
+                   k_dse_weight_error_ema * std::log(updated_weight / computed_weight);
   }
 }
 
@@ -2731,7 +2737,7 @@ bool should_switch_dse_to_devex(bool allow_switch,
   reason = nullptr;
   if (!allow_switch) { return false; }
 
-  const f_t denom = std::max(std::max(row_ep_density, col_aq_density), row_ap_density);
+  const f_t denom    = std::max(std::max(row_ep_density, col_aq_density), row_ap_density);
   f_t costly_measure = 0.0;
   if (denom > 0.0) {
     const f_t ratio = row_dse_density / denom;
@@ -2741,8 +2747,7 @@ bool should_switch_dse_to_devex(bool allow_switch,
     costly_measure > k_costly_dse_measure_limit && row_dse_density > k_costly_dse_minimum_density;
   if (costly_iteration) {
     num_costly_dse_iteration++;
-    if (num_costly_dse_iteration >
-          local_iters * k_costly_dse_fraction_costly_iters_before_switch &&
+    if (num_costly_dse_iteration > local_iters * k_costly_dse_fraction_costly_iters_before_switch &&
         local_iters > k_costly_dse_fraction_iters_before_switch * num_tot) {
       reason = "costly_dse";
       return true;
@@ -2955,9 +2960,9 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
   if (allow_dse_to_devex_switch) { effective_strategy = pricing_strategy_t::STEEPEST_EDGE; }
 
   std::vector<i_t> devex_index(n, 0);
-  i_t num_devex_iterations             = 0;
-  bool pending_devex_framework_reset   = false;
-  f_t computed_devex_weight            = 1.0;
+  i_t num_devex_iterations           = 0;
+  bool pending_devex_framework_reset = false;
+  f_t computed_devex_weight          = 1.0;
 
   f_t row_ep_density                = 0.0;
   f_t col_aq_density                = 0.0;
@@ -3013,6 +3018,11 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
   }
 
   if (phase == 2) {
+    if (uses_steepest_edge_pricing(effective_strategy)) {
+      settings.log.printf(
+        "Dual steepest-edge weight update: %s\n",
+        effective_strategy == pricing_strategy_t::QUADRATIC_STEEPEST_EDGE ? "quadratic" : "exact");
+    }
     settings.log.printf(" Iter     Objective           Num Inf.  Sum Inf.     Perturb  Time\n");
   }
 
@@ -3126,8 +3136,8 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
     if (pending_devex_framework_reset && effective_strategy == pricing_strategy_t::DEVEX) {
       phase2::initialise_devex_framework(
         basic_list, nonbasic_list, delta_y_steepest_edge, devex_index);
-      num_devex_iterations           = 0;
-      pending_devex_framework_reset  = false;
+      num_devex_iterations          = 0;
+      pending_devex_framework_reset = false;
       settings.log.printf("Reset Devex reference framework at iteration %d\n", iter);
     }
 
@@ -3142,6 +3152,7 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
       switch (effective_strategy) {
         case pricing_strategy_t::AUTOMATIC:
         case pricing_strategy_t::STEEPEST_EDGE:
+        case pricing_strategy_t::QUADRATIC_STEEPEST_EDGE:
           leaving_index =
             phase2::steepest_edge_pricing_with_infeasibilities(lp,
                                                                settings,
@@ -3334,7 +3345,7 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
 
     const f_t steepest_edge_norm_check = delta_y_sparse.norm2_squared();
     phase2_work_estimate += 2 * delta_y_sparse.i.size();
-    if (effective_strategy == pricing_strategy_t::STEEPEST_EDGE) {
+    if (uses_steepest_edge_pricing(effective_strategy)) {
       phase2::update_operation_result_density(static_cast<f_t>(delta_y_sparse.i.size()) / m,
                                               row_ep_density);
       phase2::assess_dse_weight_error(steepest_edge_norm_check,
@@ -3397,12 +3408,12 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
       }
     }
     timers.delta_z_time += timers.stop_timer();
-    if (effective_strategy == pricing_strategy_t::STEEPEST_EDGE) {
+    if (uses_steepest_edge_pricing(effective_strategy)) {
       phase2::update_operation_result_density(static_cast<f_t>(delta_z_indices.size()) / n,
                                               row_ap_density);
     } else if (effective_strategy == pricing_strategy_t::DEVEX) {
-      computed_devex_weight = phase2::compute_devex_weight(
-        delta_z_indices, delta_z, devex_index, basic_mark);
+      computed_devex_weight =
+        phase2::compute_devex_weight(delta_z_indices, delta_z, devex_index, basic_mark);
     }
     if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
       return dual_status_t::CONCURRENT_LIMIT;
@@ -3743,9 +3754,9 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
     }
     solve_work += (ft.work_estimate() - ftran_start_work);
     timers.ftran_time += timers.stop_timer();
-    if (effective_strategy == pricing_strategy_t::STEEPEST_EDGE) {
-      phase2::update_operation_result_density(
-        static_cast<f_t>(scaled_delta_xB_sparse.i.size()) / m, col_aq_density);
+    if (uses_steepest_edge_pricing(effective_strategy)) {
+      phase2::update_operation_result_density(static_cast<f_t>(scaled_delta_xB_sparse.i.size()) / m,
+                                              col_aq_density);
     }
     if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
       return dual_status_t::CONCURRENT_LIMIT;
@@ -3776,8 +3787,9 @@ dual_status_t dual_phase2_with_advanced_basis(i_t phase,
                                      phase2_work_estimate);
         num_devex_iterations++;
       }
-    } else if (effective_strategy == pricing_strategy_t::STEEPEST_EDGE) {
-      // Full steepest edge update (requires BTRAN solve)
+    } else if (uses_steepest_edge_pricing(effective_strategy)) {
+      // Steepest edge update. The exact update requires an extra BTRAN solve; the quadratic
+      // update inside skips it.
       steepest_edge_status = phase2::update_steepest_edge_norms(settings,
                                                                 basic_list,
                                                                 ft,

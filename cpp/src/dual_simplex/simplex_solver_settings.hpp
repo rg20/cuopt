@@ -30,10 +30,19 @@ namespace cuopt::mathematical_optimization::simplex {
 
 enum class pricing_strategy_t {
   AUTOMATIC         = -1,  // Start steepest-edge; one-way fallback to Devex
-  STEEPEST_EDGE     = 0,   // Exact steepest edge (default, most iterations saved but expensive init)
-  DEVEX             = 1,   // Devex approximate steepest edge (cheaper init, good performance)
-  MAX_INFEASIBILITY = 2    // Simple max infeasibility (fastest per iteration, most iterations)
+  STEEPEST_EDGE     = 0,  // Exact steepest edge (default, most iterations saved but expensive init)
+  DEVEX             = 1,  // Devex approximate steepest edge (cheaper init, good performance)
+  MAX_INFEASIBILITY = 2,  // Simple max infeasibility (fastest per iteration, most iterations)
+  QUADRATIC_STEEPEST_EDGE = 3  // Steepest edge without the extra FTRAN in the weight update
 };
+
+// True for the strategies priced on steepest-edge weights. They differ only in how the
+// weights are updated.
+constexpr bool uses_steepest_edge_pricing(pricing_strategy_t strategy)
+{
+  return strategy == pricing_strategy_t::STEEPEST_EDGE ||
+         strategy == pricing_strategy_t::QUADRATIC_STEEPEST_EDGE;
+}
 
 template <typename i_t, typename f_t>
 struct simplex_solver_settings_t {

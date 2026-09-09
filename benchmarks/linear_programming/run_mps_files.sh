@@ -77,7 +77,7 @@ Optional Arguments:
     --log-to-console   Log to console
     --model-list       File containing a list of models to run
     --pdlp-tolerances  Tolerances for PDLP solver (default: 1e-4)
-    --dual-simplex-pricing N  Dual simplex pricing: -1 automatic, 0 steepest-edge, 1 Devex, 2 max-infeasibility
+    --dual-simplex-pricing N  Dual simplex pricing: -1 automatic, 0 steepest-edge, 1 Devex, 2 max-infeasibility, 3 quadratic steepest-edge
     --recursive        Recursively search for .mps/.MPS/.SIF files under --path
     --cut-mode MODE    Cut family configuration: default, no-cuts, flow-cover-only
     -h, --help         Show this help message and exit

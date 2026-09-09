@@ -347,7 +347,8 @@ class pdlp_solver_settings_t {
   // distributed_pdlp_partitioner_t for the meaning of each value.
   distributed_pdlp_partitioner_t distributed_pdlp_partitioner{distributed_pdlp_partitioner_t::Auto};
   method_t method{method_t::Concurrent};
-  // Dual simplex pricing: -1 automatic, 0 steepest-edge (default), 1 Devex, 2 max infeasibility.
+  // Dual simplex pricing: -1 automatic, 0 steepest-edge (default), 1 Devex, 2 max infeasibility,
+  // 3 quadratic steepest-edge.
   int dual_simplex_pricing{CUOPT_DUAL_SIMPLEX_PRICING_STEEPEST_EDGE};
   bool inside_mip{false};
   // For concurrent termination

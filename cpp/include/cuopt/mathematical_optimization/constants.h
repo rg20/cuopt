@@ -213,15 +213,16 @@
 #define CUOPT_METHOD_BARRIER      3
 #define CUOPT_METHOD_UNSET        4
 
-
 /* @brief Dual simplex pricing: -1 automatic (start steepest-edge, may switch to Devex),
- *        0 steepest-edge (default), 1 Devex, 2 max infeasibility */
+ *        0 steepest-edge (default), 1 Devex, 2 max infeasibility,
+ *        3 quadratic steepest-edge */
 #define CUOPT_DUAL_SIMPLEX_PRICING "dual_simplex_pricing"
 
-#define CUOPT_DUAL_SIMPLEX_PRICING_AUTOMATIC         -1
-#define CUOPT_DUAL_SIMPLEX_PRICING_STEEPEST_EDGE     0
-#define CUOPT_DUAL_SIMPLEX_PRICING_DEVEX             1
-#define CUOPT_DUAL_SIMPLEX_PRICING_MAX_INFEASIBILITY 2
+#define CUOPT_DUAL_SIMPLEX_PRICING_AUTOMATIC               -1
+#define CUOPT_DUAL_SIMPLEX_PRICING_STEEPEST_EDGE           0
+#define CUOPT_DUAL_SIMPLEX_PRICING_DEVEX                   1
+#define CUOPT_DUAL_SIMPLEX_PRICING_MAX_INFEASIBILITY       2
+#define CUOPT_DUAL_SIMPLEX_PRICING_QUADRATIC_STEEPEST_EDGE 3
 
 #define CUOPT_BARRIER_DUAL_INITIAL_POINT_AUTOMATIC             -1
 #define CUOPT_BARRIER_DUAL_INITIAL_POINT_LUSTIG_MARSTEN_SHANNO 0
