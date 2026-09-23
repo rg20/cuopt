@@ -41,6 +41,9 @@ struct barrier_transform_t {
   cuopt::mathematical_optimization::simplex::presolve_info_t<int, double> presolve_info;
   std::vector<double> column_scales;
   std::vector<double> row_scales;
+  // Whole-problem objective rescale from barrier's Curtis-Reid + Pock-Chambolle scaling
+  // (see dual_simplex::scaling); 1.0 for every other scaling path.
+  double objective_rescaling{1.0};
   // Barrier linear objective minus crush(user c) from the first solve (Q*ell shift, etc.).
   std::vector<double> linear_obj_shift;
   std::unique_ptr<cuopt::mathematical_optimization::simplex::lp_problem_t<int, double>> barrier_lp;
@@ -104,7 +107,7 @@ inline std::vector<double> crush_user_linear_objective(barrier_transform_t const
       "column_scales.");
   }
   for (std::size_t j = 0; j < presolved.size(); ++j) {
-    presolved[j] /= xf.column_scales[j];
+    presolved[j] = presolved[j] * xf.objective_rescaling / xf.column_scales[j];
   }
   return presolved;
 }

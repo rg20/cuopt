@@ -17,13 +17,15 @@ i_t scaling(const lp_problem_t<i_t, f_t>& unscaled,
             const simplex_solver_settings_t<i_t, f_t>& settings,
             lp_problem_t<i_t, f_t>& scaled,
             std::vector<f_t>& column_scaling,
-            std::vector<f_t>& row_scaling)
+            std::vector<f_t>& row_scaling,
+            f_t& objective_rescaling)
 {
   scaled = unscaled;
   i_t m  = scaled.num_rows;
   i_t n  = scaled.num_cols;
 
   row_scaling.assign(m, 1.0);
+  objective_rescaling = f_t(1);
 
   // =========================================================================
   // Ruiz equilibration for SOCP (and QP) problems
@@ -451,6 +453,49 @@ i_t scaling(const lp_problem_t<i_t, f_t>& unscaled,
     for (i_t i = 0; i < m; ++i)
       row_scaling[i] = f_t(1) / row_scale[i];
 
+    // --- Bound + objective rescaling (ported from PDLP's bound_objective_rescaling) ---
+    // A whole-problem scalar balance, layered on top of the row/column scaling above:
+    // bound_rescale (k) uniformly rescales the RHS and variable bounds (equivalent to a
+    // uniform column scale, so it folds directly into column_scaling); objective_rescale
+    // (m) rescales the objective only. Since it touches the dual (y) and reduced cost (z)
+    // symmetrically -- independent of column_scaling's own, unrelated effect on x and z --
+    // it cannot be folded into column_scaling or row_scaling and is returned separately;
+    // see unscale_solution.
+    f_t bound_sum_sq = 0.0;
+    for (i_t i = 0; i < m; ++i)
+      bound_sum_sq += scaled.rhs[i] * scaled.rhs[i];
+    const f_t bound_rescale = f_t(1) / (std::sqrt(bound_sum_sq) + f_t(1));
+
+    f_t obj_sum_sq = 0.0;
+    for (i_t j = 0; j < n; ++j)
+      obj_sum_sq += scaled.objective[j] * scaled.objective[j];
+    const f_t objective_rescale = f_t(1) / (std::sqrt(obj_sum_sq) + f_t(1));
+
+    for (i_t i = 0; i < m; ++i) {
+      scaled.rhs[i] *= bound_rescale;
+    }
+    for (i_t j = 0; j < n; ++j) {
+      if (scaled.lower[j] > -finite_bound_limit) scaled.lower[j] *= bound_rescale;
+      if (scaled.upper[j] < finite_bound_limit) scaled.upper[j] *= bound_rescale;
+      scaled.objective[j] *= objective_rescale;
+      column_scaling[j] *= bound_rescale;
+    }
+    objective_rescaling = objective_rescale;
+
+    // compute_user_objective()/compute_presolved_objective() (dual_simplex/solve.cpp) convert
+    // between the LP's own objective terms (c^Tx computed in *this* lp's coordinate system) and
+    // the true user objective via obj_scale/obj_constant. Since bound_rescale/objective_rescale
+    // multiply c^Tx by (bound_rescale * objective_rescale) relative to unscaled, fold the inverse
+    // into scaled.obj_scale/obj_constant here so every caller downstream (barrier.cu's internal
+    // convergence checks and final reporting alike) sees the correct true-scale objective without
+    // needing to know about this rescale.
+    const f_t combined_rescale = bound_rescale * objective_rescale;
+    scaled.obj_scale /= combined_rescale;
+    scaled.obj_constant *= combined_rescale;
+
+    settings.log.printf(
+      "Bound rescaling %e, objective rescaling %e\n", bound_rescale, objective_rescale);
+
     f_t a_min = std::numeric_limits<f_t>::max();
     f_t a_max = 0;
     for (i_t p = 0; p < scaled.A.col_start[n]; ++p) {
@@ -517,6 +562,7 @@ i_t scaling(const lp_problem_t<i_t, f_t>& unscaled,
 template <typename i_t, typename f_t>
 void unscale_solution(const std::vector<f_t>& column_scaling,
                       const std::vector<f_t>& row_scaling,
+                      f_t objective_rescaling,
                       const std::vector<f_t>& scaled_x,
                       const std::vector<f_t>& scaled_y,
                       const std::vector<f_t>& scaled_z,
@@ -527,16 +573,20 @@ void unscale_solution(const std::vector<f_t>& column_scaling,
   const i_t n = scaled_x.size();
   unscaled_x.resize(n);
   unscaled_z.resize(n);
+  // z picks up 1/objective_rescaling on top of the usual column_scaling factor: scaling the
+  // objective by objective_rescaling scales the reduced cost by the same factor (see the
+  // derivation in scaling.hpp), independent of column_scaling's own effect on x and z.
   for (i_t j = 0; j < n; ++j) {
     unscaled_x[j] = scaled_x[j] / column_scaling[j];
-    unscaled_z[j] = scaled_z[j] * column_scaling[j];
+    unscaled_z[j] = scaled_z[j] * column_scaling[j] / objective_rescaling;
   }
 
   const i_t m = scaled_y.size();
   unscaled_y.resize(m);
-  // R(i,i) = 1/row_scaling[i], so y_orig = y_scaled / row_scaling
+  // R(i,i) = 1/row_scaling[i], so y_orig = y_scaled / row_scaling; y additionally picks up
+  // 1/objective_rescaling for the same reason as z above.
   for (i_t i = 0; i < m; ++i) {
-    unscaled_y[i] = scaled_y[i] / row_scaling[i];
+    unscaled_y[i] = scaled_y[i] / (row_scaling[i] * objective_rescaling);
   }
 }
 
@@ -546,10 +596,12 @@ template int scaling<int, double>(const lp_problem_t<int, double>& unscaled,
                                   const simplex_solver_settings_t<int, double>& settings,
                                   lp_problem_t<int, double>& scaled,
                                   std::vector<double>& column_scaling,
-                                  std::vector<double>& row_scaling);
+                                  std::vector<double>& row_scaling,
+                                  double& objective_rescaling);
 
 template void unscale_solution<int, double>(const std::vector<double>& column_scaling,
                                             const std::vector<double>& row_scaling,
+                                            double objective_rescaling,
                                             const std::vector<double>& scaled_x,
                                             const std::vector<double>& scaled_y,
                                             const std::vector<double>& scaled_z,

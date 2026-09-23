@@ -51,6 +51,7 @@ void unscale_uncrush_barrier_to_user(const user_problem_t<i_t, f_t>& user_proble
                                      const presolve_info_t<i_t, f_t>& presolve_info,
                                      const std::vector<f_t>& column_scales,
                                      const std::vector<f_t>& row_scales,
+                                     f_t objective_rescaling,
                                      const simplex_solver_settings_t<i_t, f_t>& barrier_settings,
                                      const lp_solution_t<i_t, f_t>& barrier_solution,
                                      lp_solution_t<i_t, f_t>& solution)
@@ -60,6 +61,7 @@ void unscale_uncrush_barrier_to_user(const user_problem_t<i_t, f_t>& user_proble
   std::vector<f_t> unscaled_z(barrier_lp.num_cols);
   unscale_solution<i_t, f_t>(column_scales,
                              row_scales,
+                             objective_rescaling,
                              barrier_solution.x,
                              barrier_solution.y,
                              barrier_solution.z,
@@ -231,9 +233,11 @@ lp_status_t solve_linear_program_with_advanced_basis(
                             presolved_lp.A.col_start[presolved_lp.num_cols]);
   std::vector<f_t> column_scales;
   std::vector<f_t> row_scales_simplex;
+  f_t objective_rescaling_simplex = 1.0;
   {
     raft::common::nvtx::range scope_scaling("DualSimplex::scaling");
-    scaling(presolved_lp, settings, lp, column_scales, row_scales_simplex);
+    scaling(
+      presolved_lp, settings, lp, column_scales, row_scales_simplex, objective_rescaling_simplex);
   }
   assert(presolved_lp.num_cols == lp.num_cols);
   lp_problem_t<i_t, f_t> phase1_problem(original_lp.handle_ptr, 1, 1, 1);
@@ -358,6 +362,7 @@ lp_status_t solve_linear_program_with_advanced_basis(
       std::vector<f_t> unscaled_z(lp.num_cols);
       unscale_solution<i_t, f_t>(column_scales,
                                  row_scales_simplex,
+                                 objective_rescaling_simplex,
                                  solution.x,
                                  solution.y,
                                  solution.z,
@@ -443,6 +448,7 @@ lp_status_t solve_linear_program_with_barrier(
                                       xf->presolve_info,
                                       xf->column_scales,
                                       xf->row_scales,
+                                      xf->objective_rescaling,
                                       barrier_settings,
                                       barrier_solution,
                                       solution);
@@ -480,7 +486,9 @@ lp_status_t solve_linear_program_with_barrier(
                                     presolved_lp.A.col_start[presolved_lp.num_cols]);
   std::vector<f_t> column_scales;
   std::vector<f_t> row_scales;
-  scaling(presolved_lp, barrier_settings, barrier_lp, column_scales, row_scales);
+  f_t objective_rescaling = 1.0;
+  scaling(
+    presolved_lp, barrier_settings, barrier_lp, column_scales, row_scales, objective_rescaling);
 
   // Solve using barrier
   lp_solution_t<i_t, f_t> barrier_solution(barrier_lp.num_rows, barrier_lp.num_cols);
@@ -503,6 +511,7 @@ lp_status_t solve_linear_program_with_barrier(
     xf->presolve_info                = presolve_info;
     xf->column_scales                = column_scales;
     xf->row_scales                   = row_scales;
+    xf->objective_rescaling          = objective_rescaling;
     xf->barrier_lp                   = std::make_unique<lp_problem_t<i_t, f_t>>(barrier_lp);
     solver_lp                        = xf->barrier_lp.get();
     cache->store_transform(std::move(xf));
@@ -567,6 +576,7 @@ lp_status_t solve_linear_program_with_barrier(
     std::vector<f_t> unscaled_z(barrier_lp.num_cols);
     unscale_solution<i_t, f_t>(column_scales,
                                row_scales,
+                               objective_rescaling,
                                barrier_solution.x,
                                barrier_solution.y,
                                barrier_solution.z,
