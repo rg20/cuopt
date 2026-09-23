@@ -264,6 +264,8 @@ solver_settings_t<i_t, f_t>::solver_settings_t() : pdlp_settings(), mip_settings
     {CUOPT_MIP_HYPER_BLOCK_BVE, &mip_settings.block_bve, true, "eliminate blocks of binaries in cuOpt's MIP presolve (needs " CUOPT_MIP_PROBING ")"},
     // PDLP scaling hyper-parameter (hidden from default --help: name contains "hyper_")
     {CUOPT_PDLP_HYPER_ENABLE_CURTIS_REID_SCALING, &pdlp_settings.hyper_params.do_curtis_reid_scaling, true, "Curtis-Reid prescaling, run before Ruiz/Pock-Chambolle scaling"},
+    // Barrier scaling hyper-parameter (hidden from default --help: name contains "hyper_")
+    {CUOPT_BARRIER_HYPER_ENABLE_CURTIS_REID_SCALING, &pdlp_settings.barrier_curtis_reid_scaling, false, "Barrier (LP-only): replace column-only scaling with Curtis-Reid + Pock-Chambolle scaling"},
   };
   // String parameters
   string_parameters = {

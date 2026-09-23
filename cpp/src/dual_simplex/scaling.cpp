@@ -328,6 +328,143 @@ i_t scaling(const lp_problem_t<i_t, f_t>& unscaled,
     return 0;
   }
 
+  if (settings.barrier && settings.barrier_curtis_reid_scaling) {
+    // =========================================================================
+    // Curtis-Reid + Pock-Chambolle scaling for barrier on plain LPs
+    // =========================================================================
+    // Ported from PDLP's initial scaling pipeline (pdlp/initial_scaling_strategy/
+    // initial_scaling.cu): a log-domain least-squares row/column fit (Curtis-Reid),
+    // followed by a single alpha=1 Pock-Chambolle pass. Replaces the plain 2-norm
+    // column-only scaling below.
+    csr_matrix_t<i_t, f_t> Arow(0, 0, 0);
+    scaled.A.to_compressed_row(Arow);
+
+    constexpr f_t finite_bound_limit = 1e20;
+    constexpr f_t min_abs_coeff      = std::numeric_limits<f_t>::min();
+
+    // --- Curtis-Reid: alternating row/column log-domain least-squares fit ---
+    std::vector<f_t> row_log_scale(m, 0.0);
+    std::vector<f_t> col_log_scale(n, 0.0);
+    constexpr i_t number_of_curtis_reid_iterations = 10;
+    for (i_t iter = 0; iter < number_of_curtis_reid_iterations; ++iter) {
+      for (i_t i = 0; i < m; ++i) {
+        const i_t rs = Arow.row_start[i];
+        const i_t re = Arow.row_start[i + 1];
+        if (re == rs) continue;
+        f_t sum = 0.0;
+        for (i_t p = rs; p < re; ++p) {
+          f_t abs_val = std::max(std::abs(Arow.x[p]), min_abs_coeff);
+          sum += -std::log(abs_val) - col_log_scale[Arow.j[p]];
+        }
+        row_log_scale[i] = sum / static_cast<f_t>(re - rs);
+      }
+      for (i_t j = 0; j < n; ++j) {
+        const i_t cs = scaled.A.col_start[j];
+        const i_t ce = scaled.A.col_start[j + 1];
+        if (ce == cs) continue;
+        f_t sum = 0.0;
+        for (i_t p = cs; p < ce; ++p) {
+          f_t abs_val = std::max(std::abs(scaled.A.x[p]), min_abs_coeff);
+          sum += -std::log(abs_val) - row_log_scale[scaled.A.i[p]];
+        }
+        col_log_scale[j] = sum / static_cast<f_t>(ce - cs);
+      }
+    }
+
+    // Fold the log-domain fit into multiplicative row/column scale factors.
+    // clamp_bound = 30 (exp(+-30) ~ [9.4e-14, 1.07e13]) bounds the range a
+    // pathological fit could produce, matching PDLP's Curtis-Reid.
+    constexpr f_t clamp_bound = f_t(30);
+    auto exp_clamped          = [clamp_bound](f_t v) {
+      return std::exp(std::min(std::max(v, -clamp_bound), clamp_bound));
+    };
+    std::vector<f_t> row_scale(m), col_scale(n);
+    for (i_t i = 0; i < m; ++i)
+      row_scale[i] = exp_clamped(row_log_scale[i]);
+    for (i_t j = 0; j < n; ++j)
+      col_scale[j] = exp_clamped(col_log_scale[j]);
+
+    for (i_t j = 0; j < n; ++j) {
+      for (i_t p = scaled.A.col_start[j]; p < scaled.A.col_start[j + 1]; ++p) {
+        scaled.A.x[p] *= row_scale[scaled.A.i[p]] * col_scale[j];
+      }
+    }
+    for (i_t i = 0; i < m; ++i) {
+      for (i_t p = Arow.row_start[i]; p < Arow.row_start[i + 1]; ++p) {
+        Arow.x[p] *= row_scale[i] * col_scale[Arow.j[p]];
+      }
+      scaled.rhs[i] *= row_scale[i];
+    }
+    for (i_t j = 0; j < n; ++j) {
+      scaled.objective[j] *= col_scale[j];
+      if (scaled.lower[j] > -finite_bound_limit) scaled.lower[j] /= col_scale[j];
+      if (scaled.upper[j] < finite_bound_limit) scaled.upper[j] /= col_scale[j];
+    }
+
+    // --- Pock-Chambolle: single alpha=1 pass balancing row/column norms ---
+    constexpr f_t alpha = f_t(1);
+    std::vector<f_t> row_weight(m, 0.0), col_weight(n, 0.0);
+    for (i_t i = 0; i < m; ++i) {
+      f_t sum = 0.0;
+      for (i_t p = Arow.row_start[i]; p < Arow.row_start[i + 1]; ++p) {
+        sum += std::pow(std::abs(Arow.x[p]), alpha);
+      }
+      row_weight[i] = sum;
+    }
+    for (i_t j = 0; j < n; ++j) {
+      f_t sum = 0.0;
+      for (i_t p = scaled.A.col_start[j]; p < scaled.A.col_start[j + 1]; ++p) {
+        sum += std::pow(std::abs(scaled.A.x[p]), f_t(2) - alpha);
+      }
+      col_weight[j] = sum;
+    }
+    std::vector<f_t> row_pc(m, 1.0), col_pc(n, 1.0);
+    for (i_t i = 0; i < m; ++i) {
+      if (row_weight[i] > 0) row_pc[i] = f_t(1) / std::sqrt(row_weight[i]);
+    }
+    for (i_t j = 0; j < n; ++j) {
+      if (col_weight[j] > 0) col_pc[j] = f_t(1) / std::sqrt(col_weight[j]);
+    }
+
+    for (i_t j = 0; j < n; ++j) {
+      for (i_t p = scaled.A.col_start[j]; p < scaled.A.col_start[j + 1]; ++p) {
+        scaled.A.x[p] *= row_pc[scaled.A.i[p]] * col_pc[j];
+      }
+    }
+    for (i_t i = 0; i < m; ++i) {
+      scaled.rhs[i] *= row_pc[i];
+      row_scale[i] *= row_pc[i];
+    }
+    for (i_t j = 0; j < n; ++j) {
+      scaled.objective[j] *= col_pc[j];
+      if (scaled.lower[j] > -finite_bound_limit) scaled.lower[j] /= col_pc[j];
+      if (scaled.upper[j] < finite_bound_limit) scaled.upper[j] /= col_pc[j];
+      col_scale[j] *= col_pc[j];
+    }
+
+    // Match the output convention used by the other branches: column_scaling[j] /
+    // row_scaling[i] are the factors to divide the *scaled* problem by to recover
+    // the unscaled one, i.e. 1 / (applied multiplicative factor).
+    column_scaling.resize(n);
+    for (i_t j = 0; j < n; ++j)
+      column_scaling[j] = f_t(1) / col_scale[j];
+    for (i_t i = 0; i < m; ++i)
+      row_scaling[i] = f_t(1) / row_scale[i];
+
+    f_t a_min = std::numeric_limits<f_t>::max();
+    f_t a_max = 0;
+    for (i_t p = 0; p < scaled.A.col_start[n]; ++p) {
+      f_t a = std::abs(scaled.A.x[p]);
+      if (a > 0) {
+        a_min = std::min(a_min, a);
+        a_max = std::max(a_max, a);
+      }
+    }
+    settings.log.printf(
+      "Curtis-Reid + Pock-Chambolle scaling: coefficient range [%e, %e]\n", a_min, a_max);
+    return 0;
+  }
+
   column_scaling.resize(n);
   f_t max = 0;
   f_t min = std::numeric_limits<f_t>::max();

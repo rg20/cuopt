@@ -307,6 +307,10 @@ class pdlp_solver_settings_t {
   // imbalance heuristic), 0 disabled, 1 enabled. Distinct from PDLP's own Ruiz
   // scaling in pdlp_hyper_params_t.
   i_t qcqp_ruiz_equilibration{-1};
+  // Whether barrier replaces its default LP-only column scaling with Curtis-Reid +
+  // Pock-Chambolle scaling (ported from PDLP's initial scaling). No effect on QP/SOCP
+  // (which already use qcqp_ruiz_equilibration) or on dual simplex.
+  bool barrier_curtis_reid_scaling{false};
   // Margin used to push the barrier method's initial iterate into the interior of the
   // nonnegative orthant / SOC (values are shifted to be at least this far from the boundary).
   f_t barrier_initial_point_safeguard{10.0};
