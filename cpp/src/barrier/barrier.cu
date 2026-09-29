@@ -17,6 +17,7 @@
 #include <barrier/second_order_cone_kernels.cuh>
 #include <barrier/sparse_cholesky.cuh>
 #include <barrier/sparse_matrix_kernels.cuh>
+#include <barrier/stagnation.hpp>
 #include <linear_algebra/dense_matrix.hpp>
 #include <linear_algebra/dense_vector.hpp>
 
@@ -4521,6 +4522,18 @@ lp_status_t barrier_solver_t<i_t, f_t>::barrier_advanced_solve(f_t start_time,
       complementarity_residual_norm < settings.barrier_relative_complementarity_tol && small_gap;
 
     const i_t iteration_limit = settings.iteration_limit;
+    stagnation_detector_t<f_t> stagnation;
+    const std::array<f_t, 4> termination_tolerances{settings.barrier_relative_feasibility_tol,
+                                                    settings.barrier_relative_optimality_tol,
+                                                    settings.barrier_relative_complementarity_tol,
+                                                    settings.barrier_relative_objective_gap_tol};
+    // Stagnation can relax one criterion only, and never without an accuracy bound.
+    constexpr f_t stagnation_limit = 1e-3;
+    const std::array<f_t, 4> stagnation_limits{
+      std::min(stagnation_limit, settings.barrier_relaxed_feasibility_tol),
+      std::min(stagnation_limit, settings.barrier_relaxed_optimality_tol),
+      std::min(stagnation_limit, settings.barrier_relaxed_complementarity_tol),
+      stagnation_limit};
 
     // Adaptive regularization for the augmented system.
     f_t dual_perturb   = (settings.barrier_dual_regularization >= 0)
@@ -4727,12 +4740,24 @@ lp_status_t barrier_solver_t<i_t, f_t>::barrier_advanced_solve(f_t start_time,
         (!data.has_cones() && data.Q.n == 0) ||
         relative_objective_gap < settings.barrier_relative_objective_gap_tol;
 
-      converged = primal_feasible && dual_feasible && small_gap && small_objective_gap;
+      converged            = primal_feasible && dual_feasible && small_gap && small_objective_gap;
+      const bool stagnated = stagnation.update({relative_primal_residual,
+                                                relative_dual_residual,
+                                                relative_complementarity_residual,
+                                                relative_objective_gap},
+                                               termination_tolerances,
+                                               stagnation_limits,
+                                               data.has_cones() || data.Q.n > 0);
 
-      if (converged) {
+      if (converged || stagnated) {
+        if (stagnated) {
+          settings.log.printf("Convergence stagnated: sustained lack of progress\n");
+        }
         settings.log.printf("\n");
-        settings.log.printf(
-          "Optimal solution found in %d iterations and %.3fs\n", iter, toc(start_time));
+        settings.log.printf("%s solution found in %d iterations and %.3fs\n",
+                            converged ? "Optimal" : "Suboptimal",
+                            iter,
+                            toc(start_time));
         settings.log.printf("Objective %+.8e\n", compute_user_objective(lp, primal_objective));
         settings.log.printf("Primal infeasibility (abs/rel): %8.2e/%8.2e\n",
                             primal_residual_norm,
