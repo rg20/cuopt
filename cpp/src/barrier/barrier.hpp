@@ -6,6 +6,7 @@
 /* clang-format on */
 #pragma once
 
+#include <barrier/convergence.hpp>
 #include <linear_algebra/dense_vector.hpp>
 
 #include <cuopt/mathematical_optimization/constants.h>
@@ -101,19 +102,18 @@ class barrier_solver_t {
                                    f_t& max_residual);
 
  private:
-  simplex::lp_status_t check_for_suboptimal_solution(iteration_data_t<i_t, f_t>& data,
-                                                     f_t start_time,
-                                                     i_t iter,
-                                                     f_t& primal_objective,
-                                                     f_t& primal_residual_norm,
-                                                     f_t& dual_residual_norm,
-                                                     f_t& complementarity_residual_norm,
-                                                     f_t& objective_gap,
-                                                     f_t& relative_primal_residual,
-                                                     f_t& relative_dual_residual,
-                                                     f_t& relative_complementarity_residual,
-                                                     f_t& relative_objective_gap,
-                                                     simplex::lp_solution_t<i_t, f_t>& solution);
+  simplex::lp_status_t return_converged_solution(iteration_data_t<i_t, f_t>& data,
+                                                 f_t start_time,
+                                                 i_t iterations,
+                                                 const convergence_metrics_t<i_t, f_t>& metrics,
+                                                 bool suboptimal,
+                                                 simplex::lp_solution_t<i_t, f_t>& solution);
+  simplex::lp_status_t return_best_solution(iteration_data_t<i_t, f_t>& data,
+                                            f_t start_time,
+                                            i_t iterations,
+                                            const convergence_monitor_t<i_t, f_t>& convergence,
+                                            const char* reason,
+                                            simplex::lp_solution_t<i_t, f_t>& solution);
 
   const simplex::lp_problem_t<i_t, f_t>& lp;
   const simplex::simplex_solver_settings_t<i_t, f_t>& settings;
