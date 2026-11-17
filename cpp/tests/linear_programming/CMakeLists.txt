@@ -10,6 +10,11 @@ ConfigureTest(LP_UNIT_TEST
     LABELS numopt)
 # ##################################################################################################
 # - Linear programming PDLP tests ----------------------------------------------------------------------
+ConfigureTest(PDLP_MEMORY_RESOURCE_TEST
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/pdlp_memory_resource_test.cu
+    LABELS numopt
+    STATIC_LIB)
+
 # Single-GPU pdlp_test.cu is compiled into NUMOPT_INTERNAL_TEST
 # (cpp/tests/internal/CMakeLists.txt). Under hidden symbol visibility it needs
 # cuopt_static, so it runs there rather than as a separate shared-linked binary.
