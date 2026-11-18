@@ -28,6 +28,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cuda/stream>
+
 #include <numeric>
 #include <stdexcept>
 
@@ -145,7 +147,7 @@ static std::unique_ptr<cpu_mip_solution_t<int, double>> make_cpu_mip_solution()
 // Build a gpu_lp_solution_t with known device data (no solver needed)
 static gpu_lp_solution_t<int, double> make_gpu_lp_solution()
 {
-  auto stream = rmm::cuda_stream_per_thread;
+  auto stream = cuda::stream_ref{cudaStreamPerThread};
 
   rmm::device_uvector<double> primal(kNVars, stream);
   rmm::device_uvector<double> dual(kNCons, stream);
@@ -180,7 +182,7 @@ static gpu_lp_solution_t<int, double> make_gpu_lp_solution()
 // Build a gpu_mip_solution_t with known device data (no solver needed)
 static gpu_mip_solution_t<int, double> make_gpu_mip_solution()
 {
-  auto stream = rmm::cuda_stream_per_thread;
+  auto stream = cuda::stream_ref{cudaStreamPerThread};
 
   rmm::device_uvector<double> sol(kNVars, stream);
   std::vector<double> h_sol = {1.0, 0.0, 1.0};
@@ -305,7 +307,7 @@ TEST_F(SolutionInterfaceTest, gpu_problem_to_optimization_problem)
   EXPECT_EQ(problem->get_n_constraints(), kNCons);
 
   // GPU problem's to_optimization_problem() returns nullptr (already a GPU problem)
-  auto concrete = problem->to_optimization_problem(&handle);
+  auto concrete = to_optimization_problem(*problem, &handle);
   EXPECT_EQ(concrete, nullptr);
 
   // Verify the data is still accessible directly on the problem
@@ -340,7 +342,7 @@ TEST_F(SolutionInterfaceTest, cpu_problem_to_optimization_problem)
   EXPECT_EQ(problem->get_n_variables(), kNVars);
   EXPECT_EQ(problem->get_n_constraints(), kNCons);
 
-  auto concrete = problem->to_optimization_problem(&handle);
+  auto concrete = to_optimization_problem(*problem, &handle);
   ASSERT_NE(concrete, nullptr);
   EXPECT_EQ(concrete->get_n_variables(), kNVars);
   EXPECT_EQ(concrete->get_n_constraints(), kNCons);
@@ -424,6 +426,115 @@ End
   EXPECT_NEAR(problem.get_quadratic_constraints()[0].rhs_value, 0.5, 1e-9);
 }
 
+// Build one CPU problem by copying the model (populate) and another by moving an equal model
+// (adopt), then assert the two are field-for-field identical. Guards the adopt path against
+// silently dropping or mis-moving any member.
+static void expect_adopt_matches_populate(const io::mps_data_model_t<int, double>& model_src)
+{
+  io::mps_data_model_t<int, double> model_for_copy = model_src;
+  io::mps_data_model_t<int, double> model_for_move = model_src;
+
+  cpu_optimization_problem_t<int, double> copied;
+  populate_from_mps_data_model(&copied, model_for_copy);
+
+  cpu_optimization_problem_t<int, double> moved;
+  adopt_from_mps_data_model(&moved, std::move(model_for_move));
+
+  // Scalars
+  EXPECT_EQ(copied.get_n_variables(), moved.get_n_variables());
+  EXPECT_EQ(copied.get_n_constraints(), moved.get_n_constraints());
+  EXPECT_EQ(copied.get_nnz(), moved.get_nnz());
+  EXPECT_EQ(copied.get_n_integers(), moved.get_n_integers());
+  EXPECT_EQ(copied.get_problem_category(), moved.get_problem_category());
+  EXPECT_EQ(copied.get_sense(), moved.get_sense());
+  EXPECT_DOUBLE_EQ(copied.get_objective_offset(), moved.get_objective_offset());
+  EXPECT_DOUBLE_EQ(copied.get_objective_scaling_factor(), moved.get_objective_scaling_factor());
+  EXPECT_EQ(copied.has_quadratic_objective(), moved.has_quadratic_objective());
+  EXPECT_EQ(copied.has_quadratic_constraints(), moved.has_quadratic_constraints());
+
+  // Numeric / char / string arrays
+  EXPECT_EQ(copied.get_constraint_matrix_values_host(), moved.get_constraint_matrix_values_host());
+  EXPECT_EQ(copied.get_constraint_matrix_indices_host(),
+            moved.get_constraint_matrix_indices_host());
+  EXPECT_EQ(copied.get_constraint_matrix_offsets_host(),
+            moved.get_constraint_matrix_offsets_host());
+  EXPECT_EQ(copied.get_constraint_bounds_host(), moved.get_constraint_bounds_host());
+  EXPECT_EQ(copied.get_constraint_lower_bounds_host(), moved.get_constraint_lower_bounds_host());
+  EXPECT_EQ(copied.get_constraint_upper_bounds_host(), moved.get_constraint_upper_bounds_host());
+  EXPECT_EQ(copied.get_objective_coefficients_host(), moved.get_objective_coefficients_host());
+  EXPECT_EQ(copied.get_variable_lower_bounds_host(), moved.get_variable_lower_bounds_host());
+  EXPECT_EQ(copied.get_variable_upper_bounds_host(), moved.get_variable_upper_bounds_host());
+  EXPECT_EQ(copied.get_row_types_host(), moved.get_row_types_host());
+  EXPECT_EQ(copied.get_variable_types_host(), moved.get_variable_types_host());
+  EXPECT_EQ(copied.get_variable_names(), moved.get_variable_names());
+  EXPECT_EQ(copied.get_row_names(), moved.get_row_names());
+
+  // Quadratic objective (CSR)
+  EXPECT_EQ(copied.get_quadratic_objective_values(), moved.get_quadratic_objective_values());
+  EXPECT_EQ(copied.get_quadratic_objective_indices(), moved.get_quadratic_objective_indices());
+  EXPECT_EQ(copied.get_quadratic_objective_offsets(), moved.get_quadratic_objective_offsets());
+
+  // Quadratic constraints (compare size + per-row key fields)
+  const auto& qc_copied = copied.get_quadratic_constraints();
+  const auto& qc_moved  = moved.get_quadratic_constraints();
+  ASSERT_EQ(qc_copied.size(), qc_moved.size());
+  for (size_t i = 0; i < qc_copied.size(); ++i) {
+    EXPECT_EQ(qc_copied[i].constraint_row_name, qc_moved[i].constraint_row_name);
+    EXPECT_EQ(qc_copied[i].constraint_row_type, qc_moved[i].constraint_row_type);
+    EXPECT_DOUBLE_EQ(qc_copied[i].rhs_value, qc_moved[i].rhs_value);
+    EXPECT_EQ(qc_copied[i].linear_values, qc_moved[i].linear_values);
+    EXPECT_EQ(qc_copied[i].linear_indices, qc_moved[i].linear_indices);
+    EXPECT_EQ(qc_copied[i].rows, qc_moved[i].rows);
+    EXPECT_EQ(qc_copied[i].cols, qc_moved[i].cols);
+    EXPECT_EQ(qc_copied[i].vals, qc_moved[i].vals);
+  }
+
+  // The moved-from model must be left empty (adopt consumed it).
+  EXPECT_EQ(model_for_move.get_n_variables(), 0);
+  EXPECT_EQ(model_for_move.get_n_constraints(), 0);
+}
+
+// adopt_from_mps_data_model must produce a problem identical to populate_from_mps_data_model.
+TEST_F(SolutionInterfaceTest, adopt_matches_populate_lp_file)
+{
+  const auto model = io::read_mps<int, double>(lp_file_);
+  expect_adopt_matches_populate(model);
+}
+
+TEST_F(SolutionInterfaceTest, adopt_matches_populate_quadratic_constraints)
+{
+  const auto model = io::read_lp_from_string<int, double>(R"LP(
+Minimize
+  obj: x + y
+Subject To
+  q0: [ 4 x * y ] <= 0.5
+Bounds
+  -1 <= x <= 1
+  -1 <= y <= 1
+End
+)LP");
+  ASSERT_TRUE(model.has_quadratic_constraints());
+  expect_adopt_matches_populate(model);
+}
+
+TEST_F(SolutionInterfaceTest, gpu_adopt_consumes_mps_data_model)
+{
+  auto model               = io::read_mps<int, double>(lp_file_);
+  const auto n_variables   = model.get_n_variables();
+  const auto n_constraints = model.get_n_constraints();
+  const auto nnz           = model.get_nnz();
+
+  raft::handle_t handle;
+  optimization_problem_t<int, double> problem(&handle);
+  adopt_from_mps_data_model(&problem, std::move(model));
+
+  EXPECT_EQ(model.get_n_variables(), 0);
+  EXPECT_EQ(model.get_n_constraints(), 0);
+  EXPECT_EQ(problem.get_n_variables(), n_variables);
+  EXPECT_EQ(problem.get_n_constraints(), n_constraints);
+  EXPECT_EQ(problem.get_nnz(), nnz);
+}
+
 // =============================================================================
 // Solution conversion tests (hand-constructed, known values)
 // =============================================================================
@@ -439,11 +550,83 @@ TEST_F(SolutionInterfaceTest, lp_solution_to_python_ret)
 
 TEST_F(SolutionInterfaceTest, cpu_lp_solution_to_python_ret)
 {
+  // Exercises cpu_lp_solution_t::to_cpu_linear_programming_ret_t(), moved into
+  // pdlp/solution_conversion_cpu.cpp -- assert every field it populates when there
+  // is no warm-start data.
   auto cpu_sol    = make_cpu_lp_solution(/*with_warmstart=*/false);
   auto python_ret = cpu_sol->to_python_lp_ret();
 
   EXPECT_FALSE(python_ret.is_gpu());
+  ASSERT_TRUE(std::holds_alternative<cuopt::cython::linear_programming_ret_t::cpu_solutions_t>(
+    python_ret.solutions_));
+  const auto& cpu =
+    std::get<cuopt::cython::linear_programming_ret_t::cpu_solutions_t>(python_ret.solutions_);
+  EXPECT_EQ(cpu.primal_solution_, (std::vector<double>{1.0, 2.0, 3.0}));
+  EXPECT_EQ(cpu.dual_solution_, (std::vector<double>{0.5, 0.6}));
+  EXPECT_EQ(cpu.reduced_cost_, (std::vector<double>{0.1, 0.2, 0.3}));
+  // No warm-start data was set, so the warm-start buffers must stay empty and the
+  // warm-start scalars must stay at their default-constructed values.
+  EXPECT_TRUE(cpu.current_primal_solution_.empty());
+  EXPECT_TRUE(cpu.current_dual_solution_.empty());
+  EXPECT_TRUE(cpu.initial_primal_average_.empty());
+  EXPECT_TRUE(cpu.initial_dual_average_.empty());
+  EXPECT_TRUE(cpu.current_ATY_.empty());
+  EXPECT_TRUE(cpu.sum_primal_solutions_.empty());
+  EXPECT_TRUE(cpu.sum_dual_solutions_.empty());
+  EXPECT_TRUE(cpu.last_restart_duality_gap_primal_solution_.empty());
+  EXPECT_TRUE(cpu.last_restart_duality_gap_dual_solution_.empty());
+  EXPECT_DOUBLE_EQ(python_ret.initial_primal_weight_, 0.0);
+  EXPECT_DOUBLE_EQ(python_ret.initial_step_size_, 0.0);
+  EXPECT_EQ(python_ret.total_pdlp_iterations_, 0);
+  EXPECT_EQ(python_ret.total_pdhg_iterations_, 0);
+  EXPECT_DOUBLE_EQ(python_ret.last_candidate_kkt_score_, 0.0);
+  EXPECT_DOUBLE_EQ(python_ret.last_restart_kkt_score_, 0.0);
+  EXPECT_DOUBLE_EQ(python_ret.sum_solution_weight_, 0.0);
+  EXPECT_EQ(python_ret.iterations_since_last_restart_, 0);
+
+  EXPECT_EQ(python_ret.termination_status_, pdlp_termination_status_t::Optimal);
+  EXPECT_EQ(python_ret.error_status_, error_type_t::Success);
+  EXPECT_NEAR(python_ret.l2_primal_residual_, 1e-8, 1e-15);
+  EXPECT_NEAR(python_ret.l2_dual_residual_, 2e-8, 1e-15);
   EXPECT_NEAR(python_ret.primal_objective_, -42.0, 1e-9);
+  EXPECT_NEAR(python_ret.dual_objective_, -42.5, 1e-9);
+  EXPECT_NEAR(python_ret.gap_, 0.5, 1e-9);
+  EXPECT_EQ(python_ret.nb_iterations_, 100);
+  EXPECT_NEAR(python_ret.solve_time_, 1.23, 1e-9);
+  EXPECT_EQ(python_ret.solved_by_, method_t::PDLP);
+}
+
+TEST_F(SolutionInterfaceTest, cpu_lp_solution_to_python_ret_with_warmstart)
+{
+  // Same conversion, exercising the branch that copies pdlp_warm_start_data_ into the
+  // cpu_solutions_t buffers and the warm-start scalars -- the part of
+  // to_cpu_linear_programming_ret_t() the previous test cannot reach.
+  auto cpu_sol    = make_cpu_lp_solution(/*with_warmstart=*/true);
+  auto python_ret = cpu_sol->to_python_lp_ret();
+
+  EXPECT_FALSE(python_ret.is_gpu());
+  const auto& cpu =
+    std::get<cuopt::cython::linear_programming_ret_t::cpu_solutions_t>(python_ret.solutions_);
+  EXPECT_EQ(cpu.current_primal_solution_, (std::vector<double>(kNVars, 0.1)));
+  EXPECT_EQ(cpu.current_dual_solution_, (std::vector<double>(kNCons, 0.2)));
+  EXPECT_EQ(cpu.initial_primal_average_, (std::vector<double>(kNVars, 0.3)));
+  EXPECT_EQ(cpu.initial_dual_average_, (std::vector<double>(kNCons, 0.4)));
+  EXPECT_EQ(cpu.current_ATY_, (std::vector<double>(kNVars, 0.5)));
+  EXPECT_EQ(cpu.sum_primal_solutions_, (std::vector<double>(kNVars, 0.6)));
+  EXPECT_EQ(cpu.sum_dual_solutions_, (std::vector<double>(kNCons, 0.7)));
+  EXPECT_EQ(cpu.last_restart_duality_gap_primal_solution_, (std::vector<double>(kNVars, 0.8)));
+  EXPECT_EQ(cpu.last_restart_duality_gap_dual_solution_, (std::vector<double>(kNCons, 0.9)));
+
+  EXPECT_DOUBLE_EQ(python_ret.initial_primal_weight_, 1.0);
+  EXPECT_DOUBLE_EQ(python_ret.initial_step_size_, 0.01);
+  EXPECT_EQ(python_ret.total_pdlp_iterations_, 100);
+  EXPECT_EQ(python_ret.total_pdhg_iterations_, 200);
+  EXPECT_NEAR(python_ret.last_candidate_kkt_score_, 1e-4, 1e-12);
+  EXPECT_NEAR(python_ret.last_restart_kkt_score_, 1e-5, 1e-12);
+  EXPECT_DOUBLE_EQ(python_ret.sum_solution_weight_, 50.0);
+  EXPECT_EQ(python_ret.iterations_since_last_restart_, 10);
+
+  EXPECT_EQ(python_ret.termination_status_, pdlp_termination_status_t::IterationLimit);
 }
 
 TEST_F(SolutionInterfaceTest, mip_solution_to_python_ret)
@@ -457,11 +640,28 @@ TEST_F(SolutionInterfaceTest, mip_solution_to_python_ret)
 
 TEST_F(SolutionInterfaceTest, cpu_mip_solution_to_python_ret)
 {
+  // Exercises cpu_mip_solution_t::to_cpu_mip_ret_t(), moved into
+  // pdlp/solution_conversion_cpu.cpp -- assert every field it populates.
   auto cpu_sol    = make_cpu_mip_solution();
   auto python_ret = cpu_sol->to_python_mip_ret();
 
   EXPECT_FALSE(python_ret.is_gpu());
+  ASSERT_TRUE(std::holds_alternative<cuopt::cython::cpu_buffer>(python_ret.solution_));
+  EXPECT_EQ(std::get<cuopt::cython::cpu_buffer>(python_ret.solution_),
+            (std::vector<double>{1.0, 0.0, 1.0}));
+
+  EXPECT_EQ(python_ret.termination_status_, mip_termination_status_t::Optimal);
+  EXPECT_EQ(python_ret.error_status_, error_type_t::Success);
   EXPECT_NEAR(python_ret.objective_, -99.0, 1e-9);
+  EXPECT_DOUBLE_EQ(python_ret.mip_gap_, 0.0);
+  EXPECT_NEAR(python_ret.solution_bound_, -99.0, 1e-9);
+  EXPECT_NEAR(python_ret.total_solve_time_, 2.34, 1e-9);
+  EXPECT_NEAR(python_ret.presolve_time_, 0.1, 1e-9);
+  EXPECT_DOUBLE_EQ(python_ret.max_constraint_violation_, 0.0);
+  EXPECT_DOUBLE_EQ(python_ret.max_int_violation_, 0.0);
+  EXPECT_DOUBLE_EQ(python_ret.max_variable_bound_violation_, 0.0);
+  EXPECT_EQ(python_ret.nodes_, 42);
+  EXPECT_EQ(python_ret.simplex_iterations_, 500);
 }
 
 // =============================================================================

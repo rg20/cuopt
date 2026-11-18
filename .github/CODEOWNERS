@@ -2,8 +2,13 @@
 *                  @nvidia/cuopt-infra-codeowners
 
 #cpp code owners
-cpp/               @nvidia/cuopt-engine-codeowners
-benchmarks/        @nvidia/cuopt-engine-codeowners
+cpp/               @nvidia/cuopt-solver-codeowners
+benchmarks/        @nvidia/cuopt-solver-codeowners
+
+#gRPC code owners (overrides cpp/ above)
+cpp/src/grpc/            @nvidia/cuopt-infra-codeowners
+cpp/include/cuopt/grpc/  @nvidia/cuopt-infra-codeowners
+cpp/tests/**/grpc/       @nvidia/cuopt-infra-codeowners
 
 #python code owners
 python/            @nvidia/cuopt-infra-codeowners
@@ -19,6 +24,7 @@ container-builder/ @nvidia/cuopt-infra-codeowners
 /.github/                       @nvidia/cuopt-ci-codeowners
 /ci/                            @nvidia/cuopt-ci-codeowners
 /.pre-commit-config.yaml        @nvidia/cuopt-ci-codeowners
+/.yamllint.yaml                 @nvidia/cuopt-ci-codeowners
 
 #agent/infra code owners (overrides .github/ for specific paths)
 /AGENTS.md                           @nvidia/cuopt-infra-codeowners

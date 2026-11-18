@@ -6,9 +6,10 @@
 /* clang-format on */
 
 #include <cuopt/error.hpp>
+#include <cuopt/export.hpp>
 #include <cuopt/mathematical_optimization/cpu_optimization_problem.hpp>
 #include <cuopt/mathematical_optimization/csr_matrix_utils.hpp>
-#include <cuopt/mathematical_optimization/optimization_problem.hpp>
+#include <cuopt/mathematical_optimization/io/mps_data_model.hpp>
 #include <cuopt/mathematical_optimization/optimization_problem_utils.hpp>
 #include <cuopt/mathematical_optimization/solve_remote.hpp>
 
@@ -24,6 +25,33 @@
 #include <unordered_map>
 
 namespace cuopt::mathematical_optimization {
+
+namespace {
+
+// Classify a problem as LP / MIP / IP from its (enum) variable types. Single source of truth
+// shared by set_variable_types() and adopt_from_mps_data_model() so the detection rule lives in
+// one place. Empty types (no variables declared) classify as LP, matching the populate path where
+// set_variable_types() is skipped and the category keeps its LP default.
+problem_category_t problem_category_from_variable_types(const std::vector<var_t>& variable_types)
+{
+  if (variable_types.empty()) { return problem_category_t::LP; }
+  const std::size_t n_discrete = static_cast<std::size_t>(
+    std::count_if(variable_types.begin(), variable_types.end(), [](var_t v) {
+      return v == var_t::INTEGER || v == var_t::SEMI_CONTINUOUS;
+    }));
+  if (n_discrete == variable_types.size()) { return problem_category_t::IP; }
+  if (n_discrete > 0) { return problem_category_t::MIP; }
+  return problem_category_t::LP;
+}
+
+bool has_semi_continuous_from_variable_types(const std::vector<var_t>& variable_types)
+{
+  return std::any_of(variable_types.begin(), variable_types.end(), [](var_t v) {
+    return v == var_t::SEMI_CONTINUOUS;
+  });
+}
+
+}  // namespace
 
 // ==============================================================================
 // Constructor
@@ -172,7 +200,8 @@ void cpu_optimization_problem_t<i_t, f_t>::add_quadratic_constraint(
   qc.vals.assign(coeff.begin(), coeff.end());
   qc.linear_values.assign(linear_values.begin(), linear_values.end());
   qc.linear_indices.assign(linear_indices.begin(), linear_indices.end());
-  io::canonicalize_coo_matrix(qc.rows, qc.cols, qc.vals);
+  io::coo_canonicalization_scratch_t<i_t, f_t> scratch;
+  io::canonicalize_coo_matrix(qc.rows, qc.cols, qc.vals, scratch);
   quadratic_constraints_.push_back(std::move(qc));
 }
 
@@ -210,18 +239,8 @@ void cpu_optimization_problem_t<i_t, f_t>::set_variable_types(const var_t* varia
   variable_types_.resize(size);
   std::copy(variable_types, variable_types + size, variable_types_.begin());
 
-  // Auto-detect problem category based on variable types (matching original optimization_problem_t)
-  i_t n_discrete = std::count_if(variable_types_.begin(), variable_types_.end(), [](auto val) {
-    return val == var_t::INTEGER || val == var_t::SEMI_CONTINUOUS;
-  });
-  // By default it is LP
-  if (n_discrete == size) {
-    problem_category_ = problem_category_t::IP;
-  } else if (n_discrete > 0) {
-    problem_category_ = problem_category_t::MIP;
-  } else {
-    problem_category_ = problem_category_t::LP;
-  }
+  problem_category_              = problem_category_from_variable_types(variable_types_);
+  has_semi_continuous_variables_ = has_semi_continuous_from_variable_types(variable_types_);
 }
 
 template <typename i_t, typename f_t>
@@ -264,6 +283,20 @@ void cpu_optimization_problem_t<i_t, f_t>::set_row_types(const char* row_types, 
   cuopt_expects(row_types != nullptr, error_type_t::ValidationError, "row_types cannot be null");
   row_types_.resize(size);
   std::copy(row_types, row_types + size, row_types_.begin());
+}
+
+template <typename i_t, typename f_t>
+void cpu_optimization_problem_t<i_t, f_t>::set_initial_primal_solution(
+  std::span<const f_t> initial_primal_solution)
+{
+  initial_primal_solution_.assign(initial_primal_solution.begin(), initial_primal_solution.end());
+}
+
+template <typename i_t, typename f_t>
+void cpu_optimization_problem_t<i_t, f_t>::set_initial_dual_solution(
+  std::span<const f_t> initial_dual_solution)
+{
+  initial_dual_solution_.assign(initial_dual_solution.begin(), initial_dual_solution.end());
 }
 
 template <typename i_t, typename f_t>
@@ -503,6 +536,12 @@ problem_category_t cpu_optimization_problem_t<i_t, f_t>::get_problem_category() 
 }
 
 template <typename i_t, typename f_t>
+bool cpu_optimization_problem_t<i_t, f_t>::has_semi_continuous_variables() const noexcept
+{
+  return has_semi_continuous_variables_;
+}
+
+template <typename i_t, typename f_t>
 const std::vector<std::string>& cpu_optimization_problem_t<i_t, f_t>::get_variable_names() const
 {
   return var_names_;
@@ -623,98 +662,16 @@ std::vector<var_t> cpu_optimization_problem_t<i_t, f_t>::get_variable_types_host
   return variable_types_;
 }
 
-// ==============================================================================
-// Conversion to optimization_problem_t
-// ==============================================================================
+template <typename i_t, typename f_t>
+std::vector<f_t> cpu_optimization_problem_t<i_t, f_t>::get_initial_primal_solution_host() const
+{
+  return initial_primal_solution_;
+}
 
 template <typename i_t, typename f_t>
-std::unique_ptr<optimization_problem_t<i_t, f_t>>
-cpu_optimization_problem_t<i_t, f_t>::to_optimization_problem(raft::handle_t const* handle_ptr)
+std::vector<f_t> cpu_optimization_problem_t<i_t, f_t>::get_initial_dual_solution_host() const
 {
-  if (handle_ptr == nullptr) {
-    throw std::runtime_error(
-      "cpu_optimization_problem_t::to_optimization_problem(): "
-      "handle_ptr is null. A RAFT handle with CUDA resources is required to convert "
-      "a CPU-backed problem to a GPU-backed optimization_problem_t.");
-  }
-
-  auto gpu_problem = std::make_unique<optimization_problem_t<i_t, f_t>>(handle_ptr);
-
-  // Set scalar values
-  gpu_problem->set_maximize(maximize_);
-  gpu_problem->set_objective_scaling_factor(objective_scaling_factor_);
-  gpu_problem->set_objective_offset(objective_offset_);
-  gpu_problem->set_problem_category(problem_category_);
-
-  // Set string values
-  if (!objective_name_.empty()) gpu_problem->set_objective_name(objective_name_);
-  if (!problem_name_.empty()) gpu_problem->set_problem_name(problem_name_);
-  if (!var_names_.empty()) gpu_problem->set_variable_names(var_names_);
-  if (!row_names_.empty()) gpu_problem->set_row_names(row_names_);
-
-  // Set CSR constraint matrix (data will be copied to GPU by optimization_problem_t setters)
-  // Use A_offsets_ presence as the guard: a valid CSR can have zero non-zeros but still
-  // needs row offsets to define the number of constraints.
-  if (!A_offsets_.empty()) {
-    gpu_problem->set_csr_constraint_matrix(A_.data(),
-                                           A_.size(),
-                                           A_indices_.data(),
-                                           A_indices_.size(),
-                                           A_offsets_.data(),
-                                           A_offsets_.size());
-  }
-
-  // Set constraint bounds
-  if (!b_.empty()) { gpu_problem->set_constraint_bounds(b_.data(), b_.size()); }
-
-  // Set objective coefficients
-  if (!c_.empty()) { gpu_problem->set_objective_coefficients(c_.data(), c_.size()); }
-
-  // Set quadratic objective if present (GPU setter symmetrizes once: H = Q + Q^T)
-  if (!Q_values_.empty()) {
-    gpu_problem->set_quadratic_objective_matrix(Q_values_.data(),
-                                                Q_values_.size(),
-                                                Q_indices_.data(),
-                                                Q_indices_.size(),
-                                                Q_offsets_.data(),
-                                                Q_offsets_.size());
-  }
-
-  if (!quadratic_constraints_.empty()) {
-    gpu_problem->set_quadratic_constraints(
-      std::vector<typename optimization_problem_interface_t<i_t, f_t>::quadratic_constraint_t>(
-        quadratic_constraints_));
-  }
-
-  // Set variable bounds
-  if (!variable_lower_bounds_.empty()) {
-    gpu_problem->set_variable_lower_bounds(variable_lower_bounds_.data(),
-                                           variable_lower_bounds_.size());
-  }
-  if (!variable_upper_bounds_.empty()) {
-    gpu_problem->set_variable_upper_bounds(variable_upper_bounds_.data(),
-                                           variable_upper_bounds_.size());
-  }
-
-  // Set variable types
-  if (!variable_types_.empty()) {
-    gpu_problem->set_variable_types(variable_types_.data(), variable_types_.size());
-  }
-
-  // Set constraint bounds
-  if (!constraint_lower_bounds_.empty()) {
-    gpu_problem->set_constraint_lower_bounds(constraint_lower_bounds_.data(),
-                                             constraint_lower_bounds_.size());
-  }
-  if (!constraint_upper_bounds_.empty()) {
-    gpu_problem->set_constraint_upper_bounds(constraint_upper_bounds_.data(),
-                                             constraint_upper_bounds_.size());
-  }
-
-  // Set row types
-  if (!row_types_.empty()) { gpu_problem->set_row_types(row_types_.data(), row_types_.size()); }
-
-  return gpu_problem;
+  return initial_dual_solution_;
 }
 
 // ==============================================================================
@@ -722,7 +679,8 @@ cpu_optimization_problem_t<i_t, f_t>::to_optimization_problem(raft::handle_t con
 // ==============================================================================
 
 template <typename i_t, typename f_t>
-void cpu_optimization_problem_t<i_t, f_t>::write_to_mps(const std::string& mps_file_path)
+void cpu_optimization_problem_t<i_t, f_t>::write_to_file(const std::string& file_path,
+                                                         file_format_t format)
 {
   // Data is already in host memory, so we can directly create a view and write
   cuopt::mathematical_optimization::io::data_model_view_t<i_t, f_t> data_model_view;
@@ -813,7 +771,11 @@ void cpu_optimization_problem_t<i_t, f_t>::write_to_mps(const std::string& mps_f
     data_model_view.set_quadratic_constraints(quadratic_constraints_);
   }
 
-  cuopt::mathematical_optimization::io::write_mps(data_model_view, mps_file_path);
+  if (format == file_format_t::lp) {
+    io::write_lp(data_model_view, file_path);
+  } else {
+    io::write_mps(data_model_view, file_path);
+  }
 }
 
 // ==============================================================================
@@ -1096,14 +1058,95 @@ void cpu_optimization_problem_t<i_t, f_t>::copy_variable_types_to_host(var_t* ou
 }
 
 // ==============================================================================
+// adopt_from_mps_data_model
+// ==============================================================================
+
+namespace {
+
+template <typename i_t, typename f_t>
+void move_quadratic_constraints_from_model(
+  cpu_optimization_problem_t<i_t, f_t>& problem,
+  std::vector<typename io::mps_data_model_t<i_t, f_t>::quadratic_constraint_t>& model_constraints)
+{
+  using model_qc_t = typename io::mps_data_model_t<i_t, f_t>::quadratic_constraint_t;
+  std::vector<typename cpu_optimization_problem_t<i_t, f_t>::quadratic_constraint_t> converted;
+  converted.reserve(model_constraints.size());
+  for (model_qc_t& qc : model_constraints) {
+    converted.push_back({qc.constraint_row_index,
+                         std::move(qc.constraint_row_name),
+                         qc.constraint_row_type,
+                         std::move(qc.linear_values),
+                         std::move(qc.linear_indices),
+                         qc.rhs_value,
+                         std::move(qc.rows),
+                         std::move(qc.cols),
+                         std::move(qc.vals)});
+  }
+  model_constraints.clear();
+  problem.set_quadratic_constraints(std::move(converted));
+}
+
+}  // namespace
+
+template <typename i_t, typename f_t>
+void cpu_optimization_problem_t<i_t, f_t>::adopt_from_mps_data_model(
+  io::mps_data_model_t<i_t, f_t>&& model)
+{
+  maximize_                 = model.maximize_;
+  n_vars_                   = model.n_vars_;
+  n_constraints_            = model.n_constraints_;
+  objective_scaling_factor_ = model.objective_scaling_factor_;
+  objective_offset_         = model.objective_offset_;
+
+  A_                       = std::move(model.A_);
+  A_indices_               = std::move(model.A_indices_);
+  A_offsets_               = std::move(model.A_offsets_);
+  b_                       = std::move(model.b_);
+  c_                       = std::move(model.c_);
+  constraint_lower_bounds_ = std::move(model.constraint_lower_bounds_);
+  constraint_upper_bounds_ = std::move(model.constraint_upper_bounds_);
+  row_types_               = std::move(model.row_types_);
+  variable_lower_bounds_   = std::move(model.variable_lower_bounds_);
+  variable_upper_bounds_   = std::move(model.variable_upper_bounds_);
+
+  objective_name_ = std::move(model.objective_name_);
+  problem_name_   = std::move(model.problem_name_);
+  var_names_      = std::move(model.var_names_);
+  row_names_      = std::move(model.row_names_);
+
+  Q_values_  = std::move(model.Q_objective_values_);
+  Q_indices_ = std::move(model.Q_objective_indices_);
+  Q_offsets_ = std::move(model.Q_objective_offsets_);
+
+  variable_types_.resize(model.var_types_.size());
+  for (size_t i = 0; i < model.var_types_.size(); ++i) {
+    variable_types_[i] = char_to_var_type(model.var_types_[i]);
+  }
+  problem_category_              = problem_category_from_variable_types(variable_types_);
+  has_semi_continuous_variables_ = has_semi_continuous_from_variable_types(variable_types_);
+
+  initial_primal_solution_ = std::move(model.initial_primal_solution_);
+  initial_dual_solution_   = std::move(model.initial_dual_solution_);
+
+  if (model.has_quadratic_constraints()) {
+    move_quadratic_constraints_from_model(*this, model.quadratic_constraints_);
+  }
+
+  model.var_types_.clear();
+  model.n_vars_        = 0;
+  model.n_constraints_ = 0;
+  model.nnz_           = 0;
+}
+
+// ==============================================================================
 // Template instantiations matching optimization_problem_t
 // ==============================================================================
 
 #if MIP_INSTANTIATE_FLOAT
-template class cpu_optimization_problem_t<int32_t, float>;
+template class CUOPT_EXPORT cpu_optimization_problem_t<int32_t, float>;
 #endif
 #if MIP_INSTANTIATE_DOUBLE
-template class cpu_optimization_problem_t<int32_t, double>;
+template class CUOPT_EXPORT cpu_optimization_problem_t<int32_t, double>;
 #endif
 
 }  // namespace cuopt::mathematical_optimization

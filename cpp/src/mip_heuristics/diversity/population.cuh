@@ -14,6 +14,7 @@
 #include <mip_heuristics/solver.cuh>
 #include <utilities/timer.hpp>
 
+#include <functional>
 #include <mutex>
 #include <random>
 #include <string>
@@ -25,14 +26,13 @@ namespace cuopt::mathematical_optimization::mip {
 template <typename i_t, typename f_t>
 class diversity_manager_t;
 
-enum class solution_origin_t { BRANCH_AND_BOUND, CPUFJ, RINS, EXTERNAL };
+enum class solution_origin_t { BRANCH_AND_BOUND, CPUFJ, EXTERNAL };
 
 constexpr const char* solution_origin_to_string(solution_origin_t origin)
 {
   switch (origin) {
     case solution_origin_t::BRANCH_AND_BOUND: return "B&B";
     case solution_origin_t::CPUFJ: return "CPUFJ";
-    case solution_origin_t::RINS: return "RINS";
     case solution_origin_t::EXTERNAL: return "injected";
     default: return "unknown";
   }
@@ -75,6 +75,13 @@ class population_t {
   bool is_better_than_best_feasible(solution_t<i_t, f_t>& sol);
   void run_all_recombiners(solution_t<i_t, f_t>& sol);
 
+  using feasible_solution_callback_t = std::function<void(const std::vector<f_t>&, f_t, f_t)>;
+  // One consumer receives the current best feasible solution, then every best-slot update.
+  // Arguments are assignment, solver objective, and user objective.
+  // Called under population locks: keep it short and do not call back into the population.
+  void set_feasible_solution_callback(feasible_solution_callback_t callback);
+  // Waits for any in-flight callback before releasing its captured state.
+  void clear_feasible_solution_callback();
   void allocate_solutions();
 
   void clear()
@@ -106,7 +113,9 @@ class population_t {
   std::pair<i_t, bool> add_solution(solution_t<i_t, f_t>&& sol);
   void add_external_solution(const std::vector<f_t>& solution,
                              f_t objective,
-                             solution_origin_t origin);
+                             solution_origin_t origin,
+                             bool from_lns = false);
+  static constexpr size_t max_external_solutions = 50;
   std::vector<solution_t<i_t, f_t>> get_external_solutions();
   void add_external_solutions_to_population();
   size_t get_external_solution_size();
@@ -161,9 +170,6 @@ class population_t {
 
   void diversity_step(i_t max_iterations_without_improvement);
 
-  void invoke_get_solution_callback(solution_t<i_t, f_t>& sol,
-                                    internals::get_solution_callback_t* callback);
-
   // does some consistency tests
   bool test_invariant();
 
@@ -193,14 +199,16 @@ class population_t {
         timer(std::numeric_limits<double>::infinity())
     {
     }
+    bool operator<(const external_solution_t& other) const { return objective < other.objective; }
+
     std::vector<f_t> solution;
     f_t objective;
     solution_origin_t origin;
     timer_t timer;  // debug timer to track how long a solution has lingered in the queue
   };
 
+  // Max-heap: the worst reported solver objective is at the front.
   std::vector<external_solution_t> external_solution_queue;
-  std::vector<external_solution_t> external_solution_queue_cpufj;
   std::mt19937 rng;
   i_t update_iter = 0;
   std::recursive_mutex write_mutex;
@@ -212,6 +220,10 @@ class population_t {
   f_t best_feasible_objective = std::numeric_limits<f_t>::max();
   assignment_hash_map_t<i_t, f_t> population_hash_map;
   cuopt::timer_t timer;
+
+  void notify_feasible_solution(solution_t<i_t, f_t>& sol);
+  std::mutex feasible_solution_callback_mutex;
+  feasible_solution_callback_t feasible_solution_callback;
 };
 
 }  // namespace cuopt::mathematical_optimization::mip

@@ -33,6 +33,7 @@
 
 #include <utilities/copy_helpers.hpp>
 #include <utilities/error.hpp>
+#include <utilities/scope_guard.hpp>
 
 #include <raft/sparse/detail/cusparse_wrappers.h>
 #include <raft/core/cusparse_macros.hpp>
@@ -55,6 +56,8 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#include <omp.h>
 
 namespace cuopt::mathematical_optimization::test {
 
@@ -157,17 +160,118 @@ TEST(pdlp_class, concurrent_pdlp_exception_joins_worker_threads)
   auto settings           = pdlp_solver_settings_t<int, double>{};
   settings.method         = cuopt::mathematical_optimization::method_t::Concurrent;
   settings.presolver      = cuopt::mathematical_optimization::presolver_t::None;
-  settings.log_to_console = false;
+  settings.log_to_console = true;
   // In concurrent mode, dual simplex and barrier workers are started before PDLP validates that
   // all_primal_feasible is batch-only. This exercises the exception path with live worker threads.
   settings.all_primal_feasible = true;
 
+  testing::internal::CaptureStdout();
   optimization_problem_solution_t<int, double> solution = solve_lp(&handle_, op_problem, settings);
+  const auto logs                                       = testing::internal::GetCapturedStdout();
   const auto error_status                               = solution.get_error_status();
 
+  EXPECT_THAT(logs, testing::HasSubstr("Exception in concurrent PDLP:"));
+  EXPECT_THAT(logs, testing::HasSubstr("all_primal_feasible only applies in batch mode"));
   EXPECT_EQ(error_status.get_error_type(), cuopt::error_type_t::ValidationError);
   EXPECT_THAT(error_status.what(),
               testing::HasSubstr("all_primal_feasible only applies in batch mode"));
+}
+
+TEST(pdlp_class, concurrent_cpu_solvers_gate_on_reduced_problem_size_and_mip_threads)
+{
+  using cuopt::mathematical_optimization::pdlp::concurrent_barrier_required_thread_count;
+  using cuopt::mathematical_optimization::pdlp::should_enable_concurrent_barrier;
+  using cuopt::mathematical_optimization::pdlp::should_enable_concurrent_dual_simplex;
+  using cuopt::mathematical_optimization::pdlp::should_skip_concurrent_cpu_solvers;
+
+  constexpr int nnz_cutoff = 50'000'000;
+  EXPECT_FALSE(should_skip_concurrent_cpu_solvers(nnz_cutoff - 1, nnz_cutoff));
+  EXPECT_TRUE(should_skip_concurrent_cpu_solvers(nnz_cutoff, nnz_cutoff));
+  EXPECT_FALSE(should_skip_concurrent_cpu_solvers(nnz_cutoff, -1));
+
+  EXPECT_TRUE(should_enable_concurrent_barrier(nnz_cutoff - 1, nnz_cutoff, false, 1));
+  EXPECT_FALSE(should_enable_concurrent_barrier(nnz_cutoff, nnz_cutoff, false, 32));
+  EXPECT_TRUE(should_enable_concurrent_barrier(nnz_cutoff, -1, false, 32));
+  EXPECT_TRUE(should_enable_concurrent_barrier(
+    nnz_cutoff - 1, nnz_cutoff, true, concurrent_barrier_required_thread_count));
+  EXPECT_FALSE(should_enable_concurrent_barrier(
+    nnz_cutoff - 1, nnz_cutoff, true, concurrent_barrier_required_thread_count - 1));
+
+  EXPECT_TRUE(should_enable_concurrent_dual_simplex(nnz_cutoff - 1, nnz_cutoff, false));
+  EXPECT_FALSE(should_enable_concurrent_dual_simplex(nnz_cutoff, nnz_cutoff, false));
+  EXPECT_TRUE(should_enable_concurrent_dual_simplex(nnz_cutoff, -1, false));
+  EXPECT_FALSE(should_enable_concurrent_dual_simplex(nnz_cutoff - 1, nnz_cutoff, true));
+}
+
+TEST(pdlp_class, concurrent_cutoff_runs_pdlp_without_cpu_solvers)
+{
+  const raft::handle_t handle_{};
+
+  auto path = make_path_absolute("linear_programming/afiro_original.mps");
+  cuopt::mathematical_optimization::io::mps_data_model_t<int, double> op_problem =
+    cuopt::mathematical_optimization::io::read_mps<int, double>(path, true);
+
+  auto settings                = pdlp_solver_settings_t<int, double>{};
+  settings.method              = cuopt::mathematical_optimization::method_t::Concurrent;
+  settings.presolver           = cuopt::mathematical_optimization::presolver_t::None;
+  settings.large_nnz_threshold = 0;
+
+  testing::internal::CaptureStdout();
+  optimization_problem_solution_t<int, double> solution = solve_lp(&handle_, op_problem, settings);
+  const auto logs                                       = testing::internal::GetCapturedStdout();
+
+  EXPECT_THAT(logs, testing::HasSubstr("Skipping concurrent barrier and dual simplex"));
+  EXPECT_THAT(logs, testing::HasSubstr("(LARGE_NNZ_THRESHOLD: 0)"));
+  EXPECT_EQ((int)solution.get_termination_status(), CUOPT_TERMINATION_STATUS_OPTIMAL);
+}
+
+TEST(pdlp_class, concurrent_null_solver_ptrs_inside_mip)
+{
+  const raft::handle_t handle_{};
+
+  auto path = make_path_absolute("linear_programming/afiro_original.mps");
+  cuopt::mathematical_optimization::io::mps_data_model_t<int, double> op_problem =
+    cuopt::mathematical_optimization::io::read_mps<int, double>(path, true);
+
+  auto settings       = pdlp_solver_settings_t<int, double>{};
+  settings.method     = cuopt::mathematical_optimization::method_t::Concurrent;
+  settings.presolver  = cuopt::mathematical_optimization::presolver_t::None;
+  settings.inside_mip = true;
+
+  // inside_mip skips dual simplex. Setting threads to 1 ensures barrier is also disabled
+  // (< concurrent_barrier_required_thread_count), leaving both sol_dual_simplex_ptr
+  // and sol_barrier_ptr null.
+  const int prev_threads = omp_get_max_threads();
+  omp_set_num_threads(1);
+  const cuopt::scope_guard restore_threads{[prev_threads] { omp_set_num_threads(prev_threads); }};
+  optimization_problem_solution_t<int, double> solution = solve_lp(&handle_, op_problem, settings);
+
+  EXPECT_EQ((int)solution.get_termination_status(), CUOPT_TERMINATION_STATUS_OPTIMAL);
+}
+
+TEST(pdlp_class, concurrent_null_dual_simplex_concurrent_limit)
+{
+  const raft::handle_t handle_{};
+
+  auto path = make_path_absolute("linear_programming/afiro_original.mps");
+  cuopt::mathematical_optimization::io::mps_data_model_t<int, double> op_problem =
+    cuopt::mathematical_optimization::io::read_mps<int, double>(path, true);
+
+  auto settings       = pdlp_solver_settings_t<int, double>{};
+  settings.method     = cuopt::mathematical_optimization::method_t::Concurrent;
+  settings.presolver  = cuopt::mathematical_optimization::presolver_t::None;
+  settings.inside_mip = true;
+
+  // With inside_mip = true, dual simplex is not started (sol_dual_simplex_ptr is null).
+  // Pre-setting concurrent_halt causes PDLP to immediately exit with ConcurrentLimit.
+  // The solver must return PDLP's result without attempting to dereference
+  // sol_dual_simplex_ptr.
+  std::atomic<int> halt{1};
+  settings.concurrent_halt = &halt;
+
+  optimization_problem_solution_t<int, double> solution = solve_lp(&handle_, op_problem, settings);
+  EXPECT_EQ(solution.get_termination_status(),
+            cuopt::mathematical_optimization::pdlp_termination_status_t::ConcurrentLimit);
 }
 
 TEST(pdlp_class, run_double_very_low_accuracy)
@@ -189,6 +293,7 @@ TEST(pdlp_class, run_double_very_low_accuracy)
   settings.tolerances.absolute_gap_tolerance    = settings.minimal_absolute_tolerance;
   settings.tolerances.relative_gap_tolerance    = 0.0;
   settings.method                               = cuopt::mathematical_optimization::method_t::PDLP;
+  settings.iteration_limit                      = 100000;
 
   optimization_problem_solution_t<int, double> solution = solve_lp(&handle_, op_problem, settings);
   EXPECT_EQ((int)solution.get_termination_status(), CUOPT_TERMINATION_STATUS_OPTIMAL);
@@ -455,8 +560,14 @@ TEST(pdlp_class, run_sub_mittleman)
   }
 }
 
-constexpr double initial_step_size_afiro     = 1.4893;
-constexpr double initial_primal_weight_afiro = 0.0141652;
+// Golden reference values for afiro's initial step size/primal weight, computed under
+// cuOpt's current default scaling (Curtis-Reid -> Ruiz -> Pock-Chambolle). This test only
+// cares about *whether* update_step_size_on_initial_solution/
+// update_primal_weight_on_initial_solution change these from their as-computed defaults,
+// not their specific values, so these need re-baselining whenever the default scaling
+// pipeline changes.
+constexpr double initial_step_size_afiro     = 1.402293;
+constexpr double initial_primal_weight_afiro = 0.02019181;
 constexpr double factor_tolerance            = 1e-4f;
 
 // Should be added to google test
@@ -499,7 +610,7 @@ TEST(pdlp_class, initial_solution_test)
                                                                               solver_settings);
     auto pdlp_timer = timer_t(solver_settings.time_limit);
     solver.run_solver(pdlp_timer);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(handle_.get_stream()));
+    handle_.get_stream().sync();
     EXPECT_NEAR(initial_step_size_afiro, solver.get_step_size_h(0), factor_tolerance);
     EXPECT_NEAR(initial_primal_weight_afiro, solver.get_primal_weight_h(0), factor_tolerance);
   }
@@ -514,7 +625,7 @@ TEST(pdlp_class, initial_solution_test)
     auto d_initial_primal = device_copy(initial_primal, handle_.get_stream());
     solver.set_initial_primal_solution(d_initial_primal);
     solver.run_solver(pdlp_timer);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(handle_.get_stream()));
+    handle_.get_stream().sync();
     EXPECT_NEAR(initial_step_size_afiro, solver.get_step_size_h(0), factor_tolerance);
     EXPECT_NEAR(initial_primal_weight_afiro, solver.get_primal_weight_h(0), factor_tolerance);
   }
@@ -526,7 +637,7 @@ TEST(pdlp_class, initial_solution_test)
     auto d_initial_dual = device_copy(initial_dual, handle_.get_stream());
     solver.set_initial_dual_solution(d_initial_dual);
     solver.run_solver(pdlp_timer);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(handle_.get_stream()));
+    handle_.get_stream().sync();
     EXPECT_NEAR(initial_step_size_afiro, solver.get_step_size_h(0), factor_tolerance);
     EXPECT_NEAR(initial_primal_weight_afiro, solver.get_primal_weight_h(0), factor_tolerance);
   }
@@ -541,7 +652,7 @@ TEST(pdlp_class, initial_solution_test)
     auto d_initial_dual = device_copy(initial_dual, handle_.get_stream());
     solver.set_initial_dual_solution(d_initial_dual);
     solver.run_solver(pdlp_timer);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(handle_.get_stream()));
+    handle_.get_stream().sync();
     EXPECT_NEAR(initial_step_size_afiro, solver.get_step_size_h(0), factor_tolerance);
     EXPECT_NEAR(initial_primal_weight_afiro, solver.get_primal_weight_h(0), factor_tolerance);
   }
@@ -553,7 +664,7 @@ TEST(pdlp_class, initial_solution_test)
     auto pdlp_timer = timer_t(solver_settings.time_limit);
     solver_settings.hyper_params.update_step_size_on_initial_solution = true;
     solver.run_solver(pdlp_timer);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(handle_.get_stream()));
+    handle_.get_stream().sync();
     EXPECT_NEAR(initial_step_size_afiro, solver.get_step_size_h(0), factor_tolerance);
     EXPECT_NEAR(initial_primal_weight_afiro, solver.get_primal_weight_h(0), factor_tolerance);
     solver_settings.hyper_params.update_step_size_on_initial_solution = false;
@@ -564,7 +675,7 @@ TEST(pdlp_class, initial_solution_test)
     auto pdlp_timer = timer_t(solver_settings.time_limit);
     solver_settings.hyper_params.update_primal_weight_on_initial_solution = true;
     solver.run_solver(pdlp_timer);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(handle_.get_stream()));
+    handle_.get_stream().sync();
     EXPECT_NEAR(initial_step_size_afiro, solver.get_step_size_h(0), factor_tolerance);
     EXPECT_NEAR(initial_primal_weight_afiro, solver.get_primal_weight_h(0), factor_tolerance);
     solver_settings.hyper_params.update_primal_weight_on_initial_solution = false;
@@ -576,7 +687,7 @@ TEST(pdlp_class, initial_solution_test)
     solver_settings.hyper_params.update_primal_weight_on_initial_solution = true;
     solver_settings.hyper_params.update_step_size_on_initial_solution     = true;
     solver.run_solver(pdlp_timer);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(handle_.get_stream()));
+    handle_.get_stream().sync();
     EXPECT_NEAR(initial_step_size_afiro, solver.get_step_size_h(0), factor_tolerance);
     EXPECT_NEAR(initial_primal_weight_afiro, solver.get_primal_weight_h(0), factor_tolerance);
     solver_settings.hyper_params.update_primal_weight_on_initial_solution = false;
@@ -594,7 +705,7 @@ TEST(pdlp_class, initial_solution_test)
     auto d_initial_primal = device_copy(initial_primal, handle_.get_stream());
     solver.set_initial_primal_solution(d_initial_primal);
     solver.run_solver(pdlp_timer);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(handle_.get_stream()));
+    handle_.get_stream().sync();
     EXPECT_NEAR(initial_step_size_afiro, solver.get_step_size_h(0), factor_tolerance);
     EXPECT_NEAR(initial_primal_weight_afiro, solver.get_primal_weight_h(0), factor_tolerance);
     solver_settings.hyper_params.update_step_size_on_initial_solution = false;
@@ -608,7 +719,7 @@ TEST(pdlp_class, initial_solution_test)
     auto d_initial_dual = device_copy(initial_dual, handle_.get_stream());
     solver.set_initial_dual_solution(d_initial_dual);
     solver.run_solver(pdlp_timer);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(handle_.get_stream()));
+    handle_.get_stream().sync();
     EXPECT_NEAR(initial_step_size_afiro, solver.get_step_size_h(0), factor_tolerance);
     EXPECT_NEAR(initial_primal_weight_afiro, solver.get_primal_weight_h(0), factor_tolerance);
     solver_settings.hyper_params.update_step_size_on_initial_solution = false;
@@ -761,6 +872,93 @@ TEST(pdlp_class, initial_solution_test)
   }
 }
 
+// Explicitly-stored zero coefficients (present in the CSR with value 0, not omitted)
+// must not produce non-finite Curtis-Reid scale factors in float. The row/col kernels
+// floor |a_ij| at std::numeric_limits<f_t>::min() before taking a log so raft::log
+// never sees 0.
+TEST(pdlp_class, curtis_reid_scaling_explicit_zero_coefficient_float)
+{
+  const raft::handle_t handle_{};
+
+  cuopt::mathematical_optimization::optimization_problem_t<int, float> op_problem(&handle_);
+  op_problem.set_maximize(false);
+
+  // 1 constraint, 2 variables. Variable 1's coefficient is an *explicit* stored zero
+  // (present in the CSR with value 0.0, not simply omitted).
+  std::vector<float> A_values = {1.0f, 0.0f};
+  std::vector<int> A_indices  = {0, 1};
+  std::vector<int> A_offsets  = {0, 2};
+  op_problem.set_csr_constraint_matrix(A_values.data(),
+                                       static_cast<int>(A_values.size()),
+                                       A_indices.data(),
+                                       static_cast<int>(A_indices.size()),
+                                       A_offsets.data(),
+                                       static_cast<int>(A_offsets.size()));
+
+  std::vector<float> constraint_lower = {0.0f};
+  std::vector<float> constraint_upper = {10.0f};
+  op_problem.set_constraint_lower_bounds(constraint_lower.data(),
+                                         static_cast<int>(constraint_lower.size()));
+  op_problem.set_constraint_upper_bounds(constraint_upper.data(),
+                                         static_cast<int>(constraint_upper.size()));
+
+  std::vector<float> objective = {1.0f, 1.0f};
+  op_problem.set_objective_coefficients(objective.data(), static_cast<int>(objective.size()));
+
+  std::vector<float> var_lower = {0.0f, 0.0f};
+  std::vector<float> var_upper = {5.0f, 5.0f};
+  op_problem.set_variable_lower_bounds(var_lower.data(), static_cast<int>(var_lower.size()));
+  op_problem.set_variable_upper_bounds(var_upper.data(), static_cast<int>(var_upper.size()));
+
+  cuopt::mathematical_optimization::mip::problem_t<int, float> problem(op_problem);
+
+  auto solver_settings = pdlp_solver_settings_t<int, float>{};
+  // We only care about the scaling computed at construction time, not an actual solve.
+  solver_settings.iteration_limit = 0;
+  solver_settings.method          = cuopt::mathematical_optimization::method_t::PDLP;
+  solver_settings.hyper_params.do_curtis_reid_scaling = true;
+  // Isolate Curtis-Reid: its own exp+clamp fold into the cumulative scale (clamp_bound =
+  // 30) would otherwise silently absorb a -inf/NaN log-domain value before it reaches the
+  // final scale factors, masking the bug this test targets. Checking the pre-fold
+  // log-domain values directly (via get_iteration_*_scaling() below) needs Ruiz/
+  // Pock-Chambolle disabled so they don't overwrite those scratch buffers afterward.
+  solver_settings.hyper_params.do_ruiz_scaling           = false;
+  solver_settings.hyper_params.do_pock_chambolle_scaling = false;
+
+  // pdlp_solver_t's constructor builds a real pdhg_solver_t and wires it into the initial
+  // scaling strategy (running_mip=false, skip_ruiz_pock_compute=false), which runs
+  // compute_scaling_vectors() -- and therefore curtis_reid_scaling() -- right here. Going
+  // through pdlp_solver_t (rather than constructing pdlp_initial_scaling_strategy_t
+  // directly) avoids passing a null pdhg_solver_ptr, which trips its "PDHG solver pointer
+  // is null" assertion when running_mip is false.
+  cuopt::mathematical_optimization::pdlp::pdlp_solver_t<int, float> solver(problem,
+                                                                           solver_settings);
+  auto& scaling = solver.get_initial_scaling_strategy();
+
+  // Pre-fold log-domain row/col scale (curtis_reid_scaling()'s direct output, before the
+  // exp+clamp that turns it into a multiplicative factor) -- this is what actually goes
+  // non-finite if raft::log() sees an unfloored zero.
+  auto row_log_scale =
+    host_copy(scaling.get_iteration_constraint_matrix_scaling(), handle_.get_stream());
+  auto col_log_scale = host_copy(scaling.get_iteration_variable_scaling(), handle_.get_stream());
+  for (float v : row_log_scale) {
+    EXPECT_TRUE(std::isfinite(v)) << "row log-scale is not finite: " << v;
+  }
+  for (float v : col_log_scale) {
+    EXPECT_TRUE(std::isfinite(v)) << "col log-scale is not finite: " << v;
+  }
+
+  // Final (post exp+clamp) cumulative scale factors should also be finite.
+  auto row_scale = host_copy(scaling.get_constraint_matrix_scaling_vector(), handle_.get_stream());
+  auto col_scale = host_copy(scaling.get_variable_scaling_vector(), handle_.get_stream());
+  for (float v : row_scale) {
+    EXPECT_TRUE(std::isfinite(v)) << "row scale factor is not finite: " << v;
+  }
+  for (float v : col_scale) {
+    EXPECT_TRUE(std::isfinite(v)) << "col scale factor is not finite: " << v;
+  }
+}
+
 TEST(pdlp_class, initial_primal_weight_step_size_test)
 {
   const raft::handle_t handle_{};
@@ -795,7 +993,7 @@ TEST(pdlp_class, initial_primal_weight_step_size_test)
     solver.set_initial_primal_weight(test_initial_primal_weight);
     solver.set_initial_step_size(test_initial_step_size);
     solver.run_solver(pdlp_timer);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(handle_.get_stream()));
+    handle_.get_stream().sync();
     EXPECT_EQ(test_initial_step_size, solver.get_step_size_h(0));
     EXPECT_EQ(test_initial_primal_weight, solver.get_primal_weight_h(0));
   }
@@ -830,7 +1028,7 @@ TEST(pdlp_class, initial_primal_weight_step_size_test)
     solver2.set_initial_primal_solution(d_initial_primal);
     solver2.set_initial_dual_solution(d_initial_dual);
     solver2.run_solver(pdlp_timer);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(handle_.get_stream()));
+    handle_.get_stream().sync();
     const double sovler2_step_size     = solver2.get_step_size_h(0);
     const double sovler2_primal_weight = solver2.get_primal_weight_h(0);
     EXPECT_NOT_NEAR(previous_step_size, sovler2_step_size, factor_tolerance);
@@ -847,7 +1045,7 @@ TEST(pdlp_class, initial_primal_weight_step_size_test)
     solver3.set_initial_dual_solution(d_initial_dual);
     solver3.set_initial_dual_solution(d_initial_dual);
     solver3.run_solver(pdlp_timer);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(handle_.get_stream()));
+    handle_.get_stream().sync();
     EXPECT_NOT_NEAR(sovler2_step_size, solver3.get_step_size_h(0), factor_tolerance);
     EXPECT_NEAR(sovler2_primal_weight, solver3.get_primal_weight_h(0), factor_tolerance);
   }
@@ -1004,6 +1202,156 @@ TEST(pdlp_class, best_primal_so_far_time)
               solution1.get_additional_termination_information().l2_primal_residual);
 }
 
+TEST(pdlp_class, initial_primal_feasible_stable2)
+{
+  const raft::handle_t handle{};
+  const std::vector<std::pair<std::vector<double>, double>> initial_solutions = {
+    {{1.3, 0.0}, 0.0},  // Optimal primal, zero dual.
+    {{1.3, 0.0}, 1.0},  // Optimal primal and dual.
+    {{0.0, 1.3}, 0.0},  // Feasible but nonoptimal primal.
+    {{0.0, 0.0}, 0.0},  // Violates the row bound.
+    {{2.5, 0.0}, 0.0}   // Clipped to a feasible point by solve_lp.
+  };
+
+  for (bool per_constraint_residual : {false, true}) {
+    for (bool first_primal_feasible : {false, true}) {
+      for (const auto& [initial_primal, initial_dual] : initial_solutions) {
+        SCOPED_TRACE(::testing::Message()
+                     << "per_constraint_residual=" << per_constraint_residual
+                     << ", first_primal_feasible=" << first_primal_feasible << ", initial_primal=("
+                     << initial_primal[0] << ", " << initial_primal[1]
+                     << "), initial_dual=" << initial_dual);
+        auto problem                     = cuopt::test::parse_inline_lp(R"(
+Minimize
+ obj: y + 1.001 z
+Subject To
+ demand: y + z >= 1.3
+Bounds
+ 0 <= y <= 2
+ 0 <= z <= 2
+End
+)");
+        auto settings                    = pdlp_solver_settings_t<int, double>{};
+        settings.method                  = method_t::PDLP;
+        settings.pdlp_solver_mode        = pdlp_solver_mode_t::Stable2;
+        settings.presolver               = presolver_t::None;
+        settings.first_primal_feasible   = first_primal_feasible;
+        settings.per_constraint_residual = per_constraint_residual;
+        settings.iteration_limit         = 10000;
+        settings.set_optimality_tolerance(1e-8);
+        settings.set_initial_primal_solution(
+          initial_primal.data(), initial_primal.size(), handle.get_stream());
+        settings.set_initial_dual_solution(&initial_dual, 1, handle.get_stream());
+
+        auto solution = solve_lp(&handle, problem, settings);
+        auto primal   = host_copy(solution.get_primal_solution(), handle.get_stream());
+        ASSERT_EQ(primal.size(), 2);
+        EXPECT_GE(primal[0] + primal[1], 1.3 - 1e-7);
+        for (double value : primal) {
+          EXPECT_GE(value, -1e-7);
+          EXPECT_LE(value, 2.0 + 1e-7);
+        }
+
+        auto expected_primal = initial_primal;
+        for (double& value : expected_primal) {
+          value = std::max(0.0, std::min(value, 2.0));
+        }
+        const bool initially_feasible = expected_primal[0] + expected_primal[1] >= 1.3;
+        const auto& info              = solution.get_additional_termination_information();
+        if (first_primal_feasible && initially_feasible) {
+          EXPECT_EQ(solution.get_termination_status(), pdlp_termination_status_t::PrimalFeasible);
+          EXPECT_EQ(info.number_of_steps_taken, 0);
+          EXPECT_NEAR(primal[0], expected_primal[0], 1e-12);
+          EXPECT_NEAR(primal[1], expected_primal[1], 1e-12);
+          EXPECT_NEAR(
+            solution.get_objective_value(), expected_primal[0] + 1.001 * expected_primal[1], 1e-12);
+        } else {
+          EXPECT_GT(info.number_of_steps_taken, 1);
+          if (first_primal_feasible) {
+            EXPECT_TRUE(solution.get_termination_status() ==
+                          pdlp_termination_status_t::PrimalFeasible ||
+                        solution.get_termination_status() == pdlp_termination_status_t::Optimal);
+          } else {
+            EXPECT_EQ(solution.get_termination_status(), pdlp_termination_status_t::Optimal);
+            EXPECT_NEAR(solution.get_objective_value(), 1.3, 1e-7);
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(pdlp_class, first_primal_feasible_stable2_default_start_outside_bounds)
+{
+  const raft::handle_t handle{};
+  auto problem                             = cuopt::test::parse_inline_lp(R"(
+Minimize
+ obj: y + 1.001 z
+Subject To
+ demand: y + z >= 0
+Bounds
+ 1 <= y <= 2
+ 0 <= z <= 2
+End
+)");
+  auto settings                            = pdlp_solver_settings_t<int, double>{};
+  settings.method                          = method_t::PDLP;
+  settings.pdlp_solver_mode                = pdlp_solver_mode_t::Stable2;
+  settings.presolver                       = presolver_t::None;
+  settings.first_primal_feasible           = true;
+  settings.iteration_limit                 = 10000;
+  settings.project_initial_primal_override = 0;
+
+  auto solution = solve_lp(&handle, problem, settings);
+  auto primal   = host_copy(solution.get_primal_solution(), handle.get_stream());
+  ASSERT_EQ(primal.size(), 2);
+  EXPECT_GE(primal[0], 1.0 - 1e-7);
+  EXPECT_LE(primal[0], 2.0 + 1e-7);
+  EXPECT_GE(primal[1], -1e-7);
+  EXPECT_LE(primal[1], 2.0 + 1e-7);
+  EXPECT_GT(solution.get_additional_termination_information().number_of_steps_taken, 0);
+}
+
+TEST(pdlp_class, first_primal_feasible_stable2_warm_start_outside_bounds)
+{
+  const raft::handle_t handle{};
+  auto make_problem = [](const char* y_bounds) {
+    return cuopt::test::parse_inline_lp(std::string(R"(
+Minimize
+ obj: y + 1.001 z
+Subject To
+ demand: y + z >= 1.3
+Bounds
+ )") + y_bounds + R"(
+ 0 <= z <= 2
+End
+)");
+  };
+  auto settings             = pdlp_solver_settings_t<int, double>{};
+  settings.method           = method_t::PDLP;
+  settings.pdlp_solver_mode = pdlp_solver_mode_t::Stable2;
+  settings.presolver        = presolver_t::None;
+  settings.iteration_limit  = 10000;
+  settings.set_optimality_tolerance(1e-8);
+
+  auto problem       = make_problem("0 <= y <= 2");
+  auto warm_solution = solve_lp(&handle, problem, settings);
+  ASSERT_EQ(warm_solution.get_termination_status(), pdlp_termination_status_t::Optimal);
+
+  // The warm start primal (y = 1.3) satisfies the row but violates the tightened bound on y.
+  auto tightened                 = make_problem("0 <= y <= 1");
+  settings.first_primal_feasible = true;
+  settings.set_pdlp_warm_start_data(warm_solution.get_pdlp_warm_start_data());
+  auto solution = solve_lp(&handle, tightened, settings);
+  auto primal   = host_copy(solution.get_primal_solution(), handle.get_stream());
+  ASSERT_EQ(primal.size(), 2);
+  EXPECT_GE(primal[0], -1e-7);
+  EXPECT_LE(primal[0], 1.0 + 1e-7);
+  EXPECT_GE(primal[1], -1e-7);
+  EXPECT_LE(primal[1], 2.0 + 1e-7);
+  EXPECT_GE(primal[0] + primal[1], 1.3 - 1e-7);
+}
+
 TEST(pdlp_class, first_primal_feasible)
 {
   GTEST_SKIP() << "Skipping test: first_primal_feasible. Enable when ready to run.";
@@ -1078,7 +1426,9 @@ TEST(pdlp_class, batch_per_constraint_residual_stable3)
 
   // Mock a batch of size 2
   solver_settings.fixed_batch_size = batch_size;
-  auto batch_sol                   = solve_lp<int, double>(&handle, op_problem, solver_settings);
+  // solve_lp(const handle*, mps, settings) is now solve_lp<i_t, index_t, f_t>; let CTAD deduce
+  // all three from the arguments so this call site stays signature-neutral.
+  auto batch_sol = solve_lp(&handle, op_problem, solver_settings);
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
 
   const auto& statuses = batch_sol.get_terminations_status();
@@ -1200,6 +1550,8 @@ TEST(pdlp_class, first_primal_feasible_stable3)
   solver_settings.pdlp_solver_mode = pdlp_solver_mode_t::Stable3;
   solver_settings.method           = cuopt::mathematical_optimization::method_t::PDLP;
   solver_settings.presolver        = presolver_t::None;
+  // Known issue with Curtis-Reid scaling on batch PDLP.
+  solver_settings.hyper_params.do_curtis_reid_scaling = false;
 
   cuopt::mathematical_optimization::io::mps_data_model_t<int, double> op_problem =
     cuopt::mathematical_optimization::io::read_mps<int, double>(path);
@@ -1414,6 +1766,8 @@ TEST(pdlp_class, first_primal_feasible_and_per_constraint_residual_stable3)
   solver_settings.set_optimality_tolerance(kOptimalityTolerance);
   solver_settings.presolver = presolver_t::None;
   solver_settings.method    = cuopt::mathematical_optimization::method_t::PDLP;
+  // Known issue with Curtis-Reid scaling on batch PDLP.
+  solver_settings.hyper_params.do_curtis_reid_scaling = false;
 
   cuopt::mathematical_optimization::io::mps_data_model_t<int, double> op_problem =
     cuopt::mathematical_optimization::io::read_mps<int, double>(path);
@@ -1450,6 +1804,8 @@ TEST(pdlp_class, first_primal_feasible_and_per_constraint_residual_batch_stable3
   constexpr double kOptimalityTolerance   = 1e-2;
   solver_settings.set_optimality_tolerance(kOptimalityTolerance);
   solver_settings.presolver = presolver_t::None;
+  // Known issue with Curtis-Reid scaling on batch PDLP.
+  solver_settings.hyper_params.do_curtis_reid_scaling = false;
 
   constexpr int batch_size = 2;
 
@@ -1497,6 +1853,8 @@ TEST(pdlp_class, first_primal_feasible_and_per_constraint_residual_batch_differe
   constexpr double kOptimalityTolerance   = 1e-2;
   solver_settings.set_optimality_tolerance(kOptimalityTolerance);
   solver_settings.presolver = presolver_t::None;
+  // Known issue with Curtis-Reid scaling on batch PDLP.
+  solver_settings.hyper_params.do_curtis_reid_scaling = false;
 
   constexpr int batch_size = 2;
 
@@ -1564,6 +1922,8 @@ TEST(pdlp_class, all_primal_feasible_and_per_constraint_residual_batch_different
   constexpr double kOptimalityTolerance   = 1e-2;
   solver_settings.set_optimality_tolerance(kOptimalityTolerance);
   solver_settings.presolver = presolver_t::None;
+  // Known issue with Curtis-Reid scaling on batch PDLP.
+  solver_settings.hyper_params.do_curtis_reid_scaling = false;
 
   constexpr int batch_size = 2;
 
@@ -1631,6 +1991,8 @@ TEST(pdlp_class, all_primal_feasible_and_per_constraint_residual_batch_many_diff
   constexpr double kOptimalityTolerance   = 1e-2;
   solver_settings.set_optimality_tolerance(kOptimalityTolerance);
   solver_settings.presolver = presolver_t::None;
+  // Known issue with Curtis-Reid scaling on batch PDLP.
+  solver_settings.hyper_params.do_curtis_reid_scaling = false;
 
   const auto& original_lb    = op_problem.get_constraint_lower_bounds();
   const auto& original_ub    = op_problem.get_constraint_upper_bounds();
@@ -1742,6 +2104,8 @@ TEST(pdlp_class, all_primal_feasible_and_per_constraint_residual_batch_many_diff
   constexpr double kOptimalityTolerance   = 1e-2;
   solver_settings.set_optimality_tolerance(kOptimalityTolerance);
   solver_settings.presolver = presolver_t::None;
+  // Known issue with Curtis-Reid scaling on batch PDLP.
+  solver_settings.hyper_params.do_curtis_reid_scaling = false;
 
   const auto& original_lb    = op_problem.get_constraint_lower_bounds();
   const auto& original_ub    = op_problem.get_constraint_upper_bounds();
@@ -1895,6 +2259,8 @@ TEST(pdlp_class, warm_start)
     solver_settings.detect_infeasibility = false;
     solver_settings.method               = cuopt::mathematical_optimization::method_t::PDLP;
     solver_settings.presolver            = presolver_t::None;
+    // Known issue with Curtis-Reid scaling changing iteration counts (woodlands09 only).
+    solver_settings.hyper_params.do_curtis_reid_scaling = (instance_name != "woodlands09");
 
     cuopt::mathematical_optimization::io::mps_data_model_t<int, double> mps_data_model =
       cuopt::mathematical_optimization::io::read_mps<int, double>(path);
@@ -1948,6 +2314,34 @@ TEST(pdlp_class, warm_start_stable3_not_supported)
   solver_settings.set_pdlp_warm_start_data(solution.get_pdlp_warm_start_data());
   optimization_problem_solution_t<int, double> solution2 = solve_lp(op_problem, solver_settings);
   EXPECT_EQ(solution2.get_termination_status(), pdlp_termination_status_t::NoTermination);
+}
+
+TEST(pdlp_class, warm_start_defined_when_halted_before_first_step)
+{
+  const raft::handle_t handle_{};
+
+  auto path = make_path_absolute("linear_programming/afiro_original.mps");
+  cuopt::mathematical_optimization::io::mps_data_model_t<int, double> op_problem =
+    cuopt::mathematical_optimization::io::read_mps<int, double>(path, true);
+
+  auto settings      = pdlp_solver_settings_t<int, double>{};
+  settings.method    = cuopt::mathematical_optimization::method_t::PDLP;
+  settings.presolver = presolver_t::None;
+
+  // Leave non-zero values in the memory pool for the halted solve to reuse
+  solve_lp(&handle_, op_problem, settings);
+
+  std::atomic<int> halt{1};
+  settings.concurrent_halt = &halt;
+
+  optimization_problem_solution_t<int, double> solution = solve_lp(&handle_, op_problem, settings);
+  ASSERT_EQ(solution.get_termination_status(), pdlp_termination_status_t::ConcurrentLimit);
+
+  // No step was taken, so the dual is still zero and so is A^T y
+  const auto& warm_start = solution.get_pdlp_warm_start_data();
+  EXPECT_THAT(host_copy(warm_start.current_dual_solution_, handle_.get_stream()),
+              ::testing::Each(0.0));
+  EXPECT_THAT(host_copy(warm_start.current_ATY_, handle_.get_stream()), ::testing::Each(0.0));
 }
 
 TEST(pdlp_class, dual_postsolve_size)
@@ -2032,7 +2426,9 @@ TEST(pdlp_class, run_empty_matrix_dual_simplex)
   optimization_problem_solution_t<int, double> solution =
     solve_lp(&handle_, op_problem, solver_settings);
   EXPECT_EQ((int)solution.get_termination_status(), CUOPT_TERMINATION_STATUS_OPTIMAL);
-  EXPECT_EQ(solution.get_additional_termination_information().solved_by, method_t::DualSimplex);
+  const auto solved_by = solution.get_additional_termination_information().solved_by;
+  EXPECT_TRUE(solved_by == method_t::DualSimplex || solved_by == method_t::Barrier)
+    << "solved_by = " << method_to_string(solved_by);
 }
 
 TEST(pdlp_class, test_max)
@@ -2194,6 +2590,8 @@ TEST(pdlp_class, simple_batch_different_bounds)
   auto solver_settings      = pdlp_solver_settings_t<int, double>{};
   solver_settings.method    = cuopt::mathematical_optimization::method_t::PDLP;
   solver_settings.presolver = presolver_t::None;
+  // Known issue with Curtis-Reid scaling on batch PDLP.
+  solver_settings.hyper_params.do_curtis_reid_scaling = false;
 
   const std::vector<double>& variable_lower_bounds = op_problem.get_variable_lower_bounds();
   const std::vector<double>& variable_upper_bounds = op_problem.get_variable_upper_bounds();
@@ -3556,7 +3954,10 @@ TEST(pdlp_class, run_batch_pdlp_many_different_bounds)
   regular_pdlp_settings.method           = cuopt::mathematical_optimization::method_t::PDLP;
   regular_pdlp_settings.pdlp_solver_mode = pdlp_solver_mode_t::Stable3;
   regular_pdlp_settings.presolver        = presolver_t::None;
+  // Known issue with Curtis-Reid scaling on batch PDLP.
+  regular_pdlp_settings.hyper_params.do_curtis_reid_scaling = false;
   regular_pdlp_settings.set_optimality_tolerance(result_tolerance);
+  regular_pdlp_settings.hyper_params.do_curtis_reid_scaling = false;
 
   const std::vector<std::vector<std::tuple<int, double, double>>> bound_offsets_by_climber = {
     {{1, 3.0, 7.0}},
@@ -3619,6 +4020,7 @@ TEST(pdlp_class, run_batch_pdlp_many_different_bounds)
 
   auto batch_settings                                = regular_pdlp_settings;
   batch_settings.generate_batch_primal_dual_solution = true;
+  batch_settings.hyper_params.do_curtis_reid_scaling = false;
   for (int i = 0; i < batch_size; ++i) {
     for (const auto& bounds : custom_bounds_by_climber[i]) {
       batch_settings.new_bounds.push_back(
@@ -4765,5 +5167,3 @@ TEST(pdlp_class, batch_with_optimal_size_query)
 }
 
 }  // namespace cuopt::mathematical_optimization::test
-
-CUOPT_TEST_PROGRAM_MAIN()

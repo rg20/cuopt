@@ -23,21 +23,34 @@ ARG PYTHON_SHORT_VER
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# gcc is required for building psutils
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential software-properties-common && \
-    add-apt-repository ppa:deadsnakes/ppa && \
-    apt-get install -y --no-install-recommends \
+# Apply all available OS security patches (fixes CVE-2026-45447 openssl and others),
+# then install Python. wget/unzip/gnupg2/software-properties-common are only needed
+# to add the deadsnakes PPA — purge them in the same layer so they never persist.
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
+        software-properties-common \
+        gnupg2 \
         wget \
         unzip \
-        gcc \
-        gnupg2 \
+    && ( for i in 1 2 3 4 5; do \
+            add-apt-repository -y ppa:deadsnakes/ppa && exit 0; \
+            echo "add-apt-repository failed (attempt ${i}/5), retrying in 5s..."; \
+            sleep 5; \
+         done; \
+         exit 1 ) \
+    && apt-get install -y --no-install-recommends \
         python${PYTHON_SHORT_VER} \
         python${PYTHON_SHORT_VER}-dev \
         python${PYTHON_SHORT_VER}-venv \
-    && apt-get install -y --no-install-recommends --only-upgrade gnupg2 \
-    && rm -rf /var/lib/apt/lists/* && \
-    python${PYTHON_SHORT_VER} -m ensurepip --upgrade && \
-    python${PYTHON_SHORT_VER} -m pip install --upgrade pip
+    && apt-get purge -y --autoremove \
+        software-properties-common \
+        gnupg2 \
+        wget \
+        unzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && python${PYTHON_SHORT_VER} -m ensurepip --upgrade \
+    && python${PYTHON_SHORT_VER} -m pip install --upgrade pip
 
 ENV DEBIAN_FRONTEND=""
 
@@ -50,11 +63,20 @@ ARG CUDA_VER
 ARG CUOPT_VER
 ARG PYTHON_SHORT_VER
 
-# Install cuOpt as root to make it available to all users
+# Install gcc (needed to build psutils), pip-install cuopt, then remove gcc
+# — all in one layer so the build-only dep never persists in the final image.
+#
+# libgomp1 is a *runtime* dependency and is installed explicitly, in the same
+# command as gcc, so that `apt-get purge --autoremove gcc` keeps it: cuDSS's
+# threading layer (libcudss_mtlayer_gomp) dlopens libgomp.so.1, and without it
+# the MIP/LP solver process dies in cudssSetThreadingLayer (status 3) as soon as
+# barrier runs — see NVIDIA/cuopt#1670. Earlier images only had libgomp1 as a
+# side effect of gcc; the purge removed it.
 RUN \
     cuda_suffix=cu$(echo ${CUDA_VER} | cut -d'.' -f1) && \
-    cuda_major_minor=$(echo ${CUDA_VER} | cut -d'.' -f1-2) && \
-    python -m pip install \
+    apt-get update \
+    && apt-get install -y --no-install-recommends gcc libgomp1 \
+    && python -m pip install \
       --extra-index-url https://pypi.nvidia.com \
       --extra-index-url https://pypi.anaconda.org/rapidsai-wheels-nightly/simple \
       --no-cache-dir \
@@ -62,15 +84,49 @@ RUN \
       "cuopt-server-${cuda_suffix}==${CUOPT_VER}" \
       "cuopt-${cuda_suffix}==${CUOPT_VER}" \
       "libcuopt-${cuda_suffix}==${CUOPT_VER}" \
-      "cuopt-sh-client==${CUOPT_VER}" && \
-    python -m pip list
+      "cuopt-sh-client==${CUOPT_VER}" \
+    && python -m pip list \
+    && apt-get purge -y --autoremove gcc \
+    && rm -rf /var/lib/apt/lists/*
 
-# Remove build-only deps to save space and reduce CVE surface area
-RUN apt-get purge -y gcc gnupg2 && rm -rf /var/lib/apt/lists/*
+# Own stage so the build toolchain doesn't persist into cuopt-final. See build_java_dynamic.sh.
+FROM install-env AS java-build
+
+ARG PYTHON_SHORT_VER
+
+# g++-12: Ubuntu 22.04's default gcc (11) fails to compile raft's std::atomic<std::shared_ptr<T>>
+# usage ("static assertion failed: std::atomic requires a trivially copyable type") -- libstdc++
+# only gained that specialization in GCC 12.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        openjdk-17-jdk \
+        build-essential \
+        g++-12 \
+    && rm -rf /var/lib/apt/lists/*
+ENV CXX=/usr/bin/g++-12
+
+# raft needs headers from nvidia-cuda-cccl; the cuXY-suffixed packages pulled in transitively are too old.
+# cmake from PyPI: apt's 3.22 is older than the project's minimum (dependencies.yaml).
+RUN python -m pip install --no-cache-dir --upgrade nvidia-cuda-cccl "cmake>=4.3,<4.5"
+
+# CMake's find_package(CUDAToolkit REQUIRED) needs nvcc on PATH; reuse cuda-headers instead of
+# installing the toolkit again via apt.
+COPY --from=cuda-headers /usr/local/cuda /usr/local/cuda
+ENV PATH="/usr/local/cuda/bin:${PATH}"
+
+COPY ./repo /build/repo
+COPY ./build_java_dynamic.sh /build/build_java_dynamic.sh
+RUN bash /build/build_java_dynamic.sh /build/repo \
+      "/usr/local/lib/python${PYTHON_SHORT_VER}/dist-packages/libcuopt" /opt/cuopt/java
 
 FROM install-env AS cuopt-final
 
 ARG PYTHON_SHORT_VER
+
+# Headless JRE to run the Java bindings; version matches java/cuopt/pom.xml's maven.compiler.release.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openjdk-17-jre-headless \
+    && rm -rf /var/lib/apt/lists/*
 
 # Make cuopt_grpc_server, cuopt_cli, and shared libraries available to all processes
 # (profile.d scripts are only sourced by login shells; ENV works for all containers)
@@ -98,10 +154,13 @@ COPY --from=cuda-libs /usr/local/cuda/lib64/libnvJitLink* /usr/local/cuda/lib64/
 # Copy CUDA headers needed for runtime compilation (e.g., CuPy NVRTC).
 COPY --from=cuda-headers /usr/local/cuda/include/ /usr/local/cuda/include/
 
-# Entrypoint supports server selection:
-#   Default:                  Python REST server
-#   CUOPT_SERVER_TYPE=grpc:   gRPC server (uses CUOPT_SERVER_PORT, CUOPT_GPU_COUNT)
-#   Explicit command:         docker run <image> cuopt_grpc_server [args...]
+COPY --from=java-build /opt/cuopt/java /opt/cuopt/java
+
+# CUOPT_SERVER_TYPE (proxy, grpc, or legacy) overrides the command.
+#   proxy (default):            HTTP proxy + cuopt_grpc_server
+#   grpc:                       gRPC server only
+#   legacy:                     Python REST server (cuopt_service)
+#   Any other command:          docker run <image> cuopt_grpc_server [args...]
 COPY ./entrypoint.sh /opt/cuopt/entrypoint.sh
 ENTRYPOINT ["/opt/cuopt/entrypoint.sh"]
-CMD ["python", "-m", "cuopt_server.cuopt_service"]
+CMD ["proxy"]

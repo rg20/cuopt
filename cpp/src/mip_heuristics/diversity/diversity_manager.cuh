@@ -21,7 +21,6 @@
 #include <cuopt/mathematical_optimization/mip/solver_settings.hpp>
 #include <cuopt/mathematical_optimization/mip/solver_stats.hpp>
 
-#include <mip_heuristics/diversity/lns/rins.cuh>
 #include <mip_heuristics/local_search/local_search.cuh>
 #include <mip_heuristics/solution/solution.cuh>
 #include <mip_heuristics/solver.cuh>
@@ -36,9 +35,8 @@ class diversity_manager_t {
  public:
   diversity_manager_t(mip_solver_context_t<i_t, f_t>& context);
   bool run_presolve(f_t time_limit, timer_t global_timer);
-  solution_t<i_t, f_t> run_solver();
+  solution_t<i_t, f_t> run_solver(branch_and_bound_t<i_t, f_t>& branch_and_bound);
   void generate_solution(f_t time_limit, bool random_start = true);
-  void run_fj_alone(solution_t<i_t, f_t>& solution);
   void run_fp_alone();
   // main loop of diversity improvements
   void main_loop();
@@ -73,7 +71,6 @@ class diversity_manager_t {
                             const std::vector<f_t>& dual_solution,
                             f_t objective);
   mip_solver_context_t<i_t, f_t>& context;
-  mip::branch_and_bound_t<i_t, f_t>* branch_and_bound_ptr;
   problem_t<i_t, f_t>* problem_ptr;
   diversity_config_t diversity_config;
   population_t<i_t, f_t> population;
@@ -101,8 +98,6 @@ class diversity_manager_t {
   std::mutex relaxed_solution_mutex;
   // atomic for signalling pdlp to stop
   std::atomic<int> global_concurrent_halt{0};
-
-  rins_t<i_t, f_t> rins;
 
   bool run_only_ls_recombiner{false};
   bool run_only_bp_recombiner{false};

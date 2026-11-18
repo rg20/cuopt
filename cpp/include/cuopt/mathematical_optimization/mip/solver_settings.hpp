@@ -11,17 +11,20 @@
 #include <vector>
 
 #include <cuopt/mathematical_optimization/constants.h>
-#include <cuopt/mathematical_optimization/mip/diving_hyper_params.hpp>
-#include <cuopt/mathematical_optimization/mip/heuristics_hyper_params.hpp>
+#include <cuopt/export.hpp>
+#include <cuopt/mathematical_optimization/mip/mip_hyper_params.hpp>
 #include <cuopt/mathematical_optimization/pdlp/pdlp_hyper_params.cuh>
+#include <cuopt/mathematical_optimization/pdlp/solver_settings.hpp>
 #include <cuopt/mathematical_optimization/utilities/internals.hpp>
 
+#include <cuda/stream>
 #include <raft/core/device_span.hpp>
 #include <rmm/device_uvector.hpp>
 
 #include <vector>
 
-namespace cuopt::mathematical_optimization {
+namespace cuopt {
+namespace CUOPT_EXPORT mathematical_optimization {
 
 struct benchmark_info_t {
   double last_improvement_of_best_feasible    = 0;
@@ -86,7 +89,8 @@ class mip_solver_settings_t {
    */
   void add_initial_solution(const f_t* initial_solution,
                             i_t size,
-                            rmm::cuda_stream_view stream = rmm::cuda_stream_default);
+                            cuda::stream_ref stream = cuda::stream_ref{
+                              cudaStream_t{cudaStreamDefault}});
 
   /**
    * @brief Get the callback for the user solution
@@ -117,7 +121,6 @@ class mip_solver_settings_t {
   f_t work_limit                = std::numeric_limits<f_t>::infinity();
   f_t semi_continuous_big_m     = f_t(1e10);
   i_t node_limit                = std::numeric_limits<i_t>::max();
-  bool heuristics_only          = false;
   i_t reliability_branching     = -1;
   i_t num_cpu_threads           = -1;  // -1 means use default number of threads in branch and bound
   i_t symmetry                  = -1;
@@ -129,18 +132,23 @@ class mip_solver_settings_t {
   i_t clique_cuts               = -1;
   i_t zero_half_cuts            = -1;
   i_t implied_bound_cuts        = -1;
-  i_t strong_chvatal_gomory_cuts = -1;
-  i_t reduced_cost_strengthening = -1;
-  i_t objective_step             = 1;  // 0 = disable objective step tightening, 1 = enable
-  f_t cut_change_threshold       = -1.0;
-  f_t cut_min_orthogonality      = 0.5;
+  i_t strong_chvatal_gomory_cuts       = -1;
+  i_t reduced_cost_strengthening       = -1;
+  i_t dual_degenerate_feasibility_pump = -1;  // -1 = automatic (off), 0 = off, 1 = on
+  i_t primal_degenerate_pivots         = -1;  // -1 = automatic (on), 0 = off, 1 = on
+  i_t dual_degenerate_pivots = -1;  // -1 = automatic (off), 0 = off, 1 = root/dives, 2 = everywhere
+  i_t objective_step         = 1;   // 0 = disable objective step tightening, 1 = enable
+  f_t cut_change_threshold   = -1.0;
+  f_t cut_min_orthogonality  = 0.5;
   i_t mip_batch_pdlp_strong_branching{
     0};  // 0 = DS only, 1 = cooperative DS + PDLP, 2 = batch PDLP only
   i_t mip_batch_pdlp_reliability_branching{
     0};  // 0 = DS only, 1 = cooperative DS + PDLP, 2 = batch PDLP only
   i_t strong_branching_simplex_iteration_limit = -1;
   i_t num_gpus                                 = 1;
-  bool log_to_console                          = true;
+  method_t method{method_t::Concurrent};
+  i_t large_nnz_threshold{50'000'000};
+  bool log_to_console = true;
 
   std::string log_file;
   std::string sol_file;
@@ -183,9 +191,7 @@ class mip_solver_settings_t {
   // TODO check with Akif and Alice
   pdlp::pdlp_hyper_params_t hyper_params;
 
-  mip_heuristics_hyper_params_t<i_t, f_t> heuristic_params;
-
-  mip_diving_hyper_params_t<i_t, f_t> diving_params;
+  mip::mip_hyper_params_t<i_t, f_t> mip_hyper_params;
 
  private:
   std::vector<internals::base_solution_callback_t*> mip_callbacks_;
@@ -230,4 +236,5 @@ struct mip_solver_settings_accessor {
   }
 };
 
-}  // namespace cuopt::mathematical_optimization
+}  // namespace CUOPT_EXPORT mathematical_optimization
+}  // namespace cuopt

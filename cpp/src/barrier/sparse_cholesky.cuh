@@ -16,11 +16,38 @@
 #include <cuda_runtime.h>
 #include <utilities/driver_helpers.cuh>
 
+#include <cuda/stream>
 #include <raft/core/nvtx.hpp>
 
 #include "cudss.h"
 
+#include <dlfcn.h>
+
 namespace cuopt::mathematical_optimization::barrier {
+
+namespace detail {
+
+// Pin cuDSS's dlopen'd threading-layer plugin so cudssDestroy()'s later dlclose() can't unmap
+// it while its own OpenMP threads may still be running (#1219). Must be the exact path
+// cudssSetThreadingLayer() uses below, since CUDSS_THREADING_LIB can override the default.
+// Returns whether the pin succeeded; the caller must not call cudssSetThreadingLayer on a
+// library it couldn't pin, since cuDSS may still load a same-named library through its own
+// resolution and leave it genuinely unpinned against the #1219 teardown race.
+inline bool pin_cudss_threading_layer(const char* lib_file)
+{
+  if (lib_file == nullptr) return false;
+  void* handle = dlopen(lib_file, RTLD_NOW | RTLD_NODELETE);
+  if (handle == nullptr) {
+    fprintf(stderr, "Warning: could not pin cuDSS threading layer '%s': %s\n", lib_file, dlerror());
+    return false;
+  }
+  // RTLD_NODELETE already guarantees the mapping outlives dlclose(); closing here just avoids
+  // accumulating loader-internal refcount state across repeated construction.
+  dlclose(handle);
+  return true;
+}
+
+}  // namespace detail
 
 template <typename i_t, typename f_t>
 class sparse_cholesky_base_t {
@@ -144,7 +171,8 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
       positive_definite(true),
       A_created(false),
       settings_(settings),
-      stream(handle_ptr->get_stream())
+      symbolic_done_(false),
+      stream(handle_ptr->get_stream().get())
   {
     int major, minor, patch;
     cudssGetProperty(MAJOR_VERSION, &major);
@@ -221,7 +249,7 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
       // 4. Create the green context and stream for that green
       // context CUstream barrier_green_ctx_stream;
       i_t stream_priority;
-      cudaStream_t cuda_stream    = handle_ptr_->get_stream();
+      cudaStream_t cuda_stream    = handle_ptr_->get_stream().get();
       cudaError_t priority_result = cudaStreamGetPriority(cuda_stream, &stream_priority);
       RAFT_CUDA_TRY(priority_result);
       auto cuGreenCtxCreate_func = cuopt::get_driver_entry_point("cuGreenCtxCreate");
@@ -258,9 +286,26 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
     }
 
     if (cudss_mt_lib_file != nullptr) {
-      settings.log.printf("cuDSS Threading layer       : %s\n", cudss_mt_lib_file);
-      CUDSS_CALL_AND_CHECK_EXIT(
-        cudssSetThreadingLayer(handle, cudss_mt_lib_file), status, "cudssSetThreadingLayer");
+      if (!detail::pin_cudss_threading_layer(cudss_mt_lib_file)) {
+        settings.log.printf(
+          "cuDSS Threading layer       : could not pin '%s'; falling back to single-threaded "
+          "cuDSS. Set the CUDSS_THREADING_LIB environment variable to an absolute path, or "
+          "ensure the host provides libgomp.so.1, to enable multi-threaded cuDSS.\n",
+          cudss_mt_lib_file);
+      } else {
+        cudssStatus_t threading_status = cudssSetThreadingLayer(handle, cudss_mt_lib_file);
+        if (threading_status == CUDSS_STATUS_SUCCESS) {
+          settings.log.printf("cuDSS Threading layer       : %s\n", cudss_mt_lib_file);
+        } else {
+          settings.log.printf(
+            "cuDSS Threading layer       : could not load '%s' (status = %d); falling back "
+            "to single-threaded cuDSS. Set the CUDSS_THREADING_LIB environment variable to "
+            "an absolute path, or ensure the host provides libgomp.so.1, to enable "
+            "multi-threaded cuDSS.\n",
+            cudss_mt_lib_file,
+            threading_status);
+        }
+      }
     }
 
     CUDSS_CALL_AND_CHECK_EXIT(cudssConfigCreate(&solverConfig), status, "cudssConfigCreate");
@@ -276,7 +321,7 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
       status,
       "cudssConfigSet for device count");
 
-#if CUDSS_VERSION_MAJOR >= 0 && CUDSS_VERSION_MINOR >= 7
+#if CUDSS_VERSION_MAJOR > 0 || (CUDSS_VERSION_MAJOR == 0 && CUDSS_VERSION_MINOR >= 7)
     if (settings_.concurrent_halt != nullptr) {
       CUDSS_CALL_AND_CHECK_EXIT(cudssDataSet(handle,
                                              solverData,
@@ -298,6 +343,30 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
     }
 #endif
 
+    // cuDSS rejects ND_NLEVELS <= 1, and a failed cudssConfigSet exits, so ignore those values.
+    if (settings_.cudss_nd_nlevels >= 2) {
+      settings_.log.printf("cuDSS ND levels             : %d\n", settings_.cudss_nd_nlevels);
+      int32_t nd_nlevels = settings_.cudss_nd_nlevels;
+      CUDSS_CALL_AND_CHECK_EXIT(
+        cudssConfigSet(solverConfig, CUDSS_CONFIG_ND_NLEVELS, &nd_nlevels, sizeof(int32_t)),
+        status,
+        "cudssConfigSet for ND nlevels");
+    } else if (settings_.cudss_nd_nlevels != -1) {
+      settings_.log.printf("cuDSS ND levels             : %d ignored, must be at least 2\n",
+                           settings_.cudss_nd_nlevels);
+    }
+
+    if (settings_.cudss_hybrid_execute_mode >= 0) {
+      settings_.log.printf("cuDSS hybrid execute mode   : %d\n",
+                           settings_.cudss_hybrid_execute_mode);
+      int32_t hybrid_execute_mode = settings_.cudss_hybrid_execute_mode;
+      CUDSS_CALL_AND_CHECK_EXIT(
+        cudssConfigSet(
+          solverConfig, CUDSS_CONFIG_HYBRID_EXECUTE_MODE, &hybrid_execute_mode, sizeof(int32_t)),
+        status,
+        "cudssConfigSet for hybrid execute mode");
+    }
+
 #if USE_ITERATIVE_REFINEMENT
     int32_t ir_n_steps = 2;
     CUDSS_CALL_AND_CHECK_EXIT(
@@ -306,14 +375,18 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
       "cudssConfigSet for ir n steps");
 #endif
 
-#if USE_MATCHING
-    settings_.log.printf("Using matching\n");
-    int32_t use_matching = 1;
+    // cuDSS 1.0 chooses matching and pivoting automatically; turn matching off and use diagonal
+    // pivoting.
+    cudssMatchingAlg_t matching_alg = CUDSS_MATCHING_ALG_NONE;
     CUDSS_CALL_AND_CHECK_EXIT(
-      cudssConfigSet(solverConfig, CUDSS_CONFIG_USE_MATCHING, &use_matching, sizeof(int32_t)),
+      cudssConfigSet(solverConfig, CUDSS_CONFIG_MATCHING_ALG, &matching_alg, sizeof(matching_alg)),
       status,
-      "cudssConfigSet for use matching");
-#endif
+      "cudssConfigSet for matching alg");
+    cudssPivotType_t pivot_type = CUDSS_PIVOT_DIAGONAL;
+    CUDSS_CALL_AND_CHECK_EXIT(
+      cudssConfigSet(solverConfig, CUDSS_CONFIG_PIVOT_TYPE, &pivot_type, sizeof(pivot_type)),
+      status,
+      "cudssConfigSet for pivot type");
 
     // Device pointers
     csr_offset_d  = nullptr;
@@ -347,7 +420,7 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
       status,
       "cudssMatrixCreateDn for x");
 #endif
-    handle_ptr_->get_stream().synchronize();
+    handle_ptr_->get_stream().sync();
   }
 
   ~sparse_cholesky_cudss_t() override
@@ -381,7 +454,7 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
       CU_CHECK(
         reinterpret_cast<decltype(::cuGreenCtxDestroy)*>(cuGreenCtxDestroy_func)(barrier_green_ctx),
         reinterpret_cast<decltype(::cuGetErrorString)*>(cuGetErrorString_func));
-      handle_ptr_->get_stream().synchronize();
+      handle_ptr_->get_stream().sync();
     }
 #endif
   }
@@ -483,6 +556,8 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
       status =
         cudssExecute(handle, CUDSS_PHASE_REORDERING, solverConfig, solverData, A, cudss_x, cudss_b);
       if (settings_.concurrent_halt != nullptr && *settings_.concurrent_halt == 1) {
+        RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+        handle_ptr_->get_stream().sync();
         return CONCURRENT_HALT_RETURN;
       }
       if (status != CUDSS_STATUS_SUCCESS) {
@@ -499,6 +574,8 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
       status = cudssExecute(
         handle, CUDSS_PHASE_SYMBOLIC_FACTORIZATION, solverConfig, solverData, A, cudss_x, cudss_b);
       if (settings_.concurrent_halt != nullptr && *settings_.concurrent_halt == 1) {
+        RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+        handle_ptr_->get_stream().sync();
         return CONCURRENT_HALT_RETURN;
       }
       if (status != CUDSS_STATUS_SUCCESS) {
@@ -512,7 +589,6 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
     RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
     f_t symbolic_factorization_time = toc(start_symbolic_factor);
     settings_.log.printf("Symbolic factorization time : %.2fs\n", symbolic_factorization_time);
-    settings_.log.printf("Total symbolic time         : %.2fs\n", toc(start_symbolic));
     int64_t lu_nz       = 0;
     size_t size_written = 0;
     CUDSS_CALL_AND_CHECK(
@@ -523,13 +599,23 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
     // TODO: Is there any way to get nonzeros in the factors?
     // TODO: Is there any way to get flops for the factorization?
     RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
-    handle_ptr_->get_stream().synchronize();
+    handle_ptr_->get_stream().sync();
 
+    symbolic_done_ = true;
     return 0;
   }
   i_t factorize(device_csr_matrix_t<i_t, f_t>& Arow) override
   {
     raft::common::nvtx::range fun_scope("Factorize: cuDSS");
+
+    if (!symbolic_done_ || !A_created) {
+      settings_.log.printf(
+        "Error: cuDSS factorize(device_csr) called before analyze (symbolic_done=%d "
+        "A_created=%d)\n",
+        static_cast<int>(symbolic_done_),
+        static_cast<int>(A_created));
+      return -1;
+    }
 
 // #define PRINT_MATRIX_NORM
 #ifdef PRINT_MATRIX_NORM
@@ -557,6 +643,8 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
     status            = cudssExecute(
       handle, CUDSS_PHASE_FACTORIZATION, solverConfig, solverData, A, cudss_x, cudss_b);
     if (settings_.concurrent_halt != nullptr && *settings_.concurrent_halt == 1) {
+      RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+      handle_ptr_->get_stream().sync();
       return CONCURRENT_HALT_RETURN;
     }
     if (status != CUDSS_STATUS_SUCCESS) {
@@ -573,6 +661,8 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
 
     f_t numeric_time = toc(start_numeric);
     if (settings_.concurrent_halt != nullptr && *settings_.concurrent_halt == 1) {
+      RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+      handle_ptr_->get_stream().sync();
       return CONCURRENT_HALT_RETURN;
     }
 
@@ -583,7 +673,7 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
       status,
       "cudssDataGet for info");
 
-    handle_ptr_->get_stream().synchronize();
+    handle_ptr_->get_stream().sync();
     RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
     if (info != 0) {
       settings_.log.printf("Factorization failed info %d\n", info);
@@ -695,15 +785,22 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
       return CONCURRENT_HALT_RETURN;
     }
     f_t start_analysis = tic();
-    CUDSS_CALL_AND_CHECK(
-      cudssExecute(handle, CUDSS_PHASE_REORDERING, solverConfig, solverData, A, cudss_x, cudss_b),
-      status,
-      "cudssExecute for reordering");
-
-    f_t reorder_time = toc(start_analysis);
+    status =
+      cudssExecute(handle, CUDSS_PHASE_REORDERING, solverConfig, solverData, A, cudss_x, cudss_b);
     if (settings_.concurrent_halt != nullptr && *settings_.concurrent_halt == 1) {
+      RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+      handle_ptr_->get_stream().sync();
       return CONCURRENT_HALT_RETURN;
     }
+    if (status != CUDSS_STATUS_SUCCESS) {
+      settings_.log.printf(
+        "FAILED: CUDSS call ended unsuccessfully with status = %d, details: cuDSSExecute for "
+        "reordering\n",
+        status);
+      return -1;
+    }
+
+    f_t reorder_time = toc(start_analysis);
 
     f_t start_symbolic = tic();
 
@@ -718,7 +815,7 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
     settings_.log.printf("Symbolic factorization time : %.2fs\n", symbolic_time);
     if (settings_.concurrent_halt != nullptr && *settings_.concurrent_halt == 1) {
       RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
-      handle_ptr_->get_stream().synchronize();
+      handle_ptr_->get_stream().sync();
       return CONCURRENT_HALT_RETURN;
     }
     int64_t lu_nz       = 0;
@@ -729,7 +826,7 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
       "cudssDataGet for LU_NNZ");
     settings_.log.printf("Symbolic nonzeros in factor : %.2e\n", static_cast<f_t>(lu_nz) / 2.0);
     RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
-    handle_ptr_->get_stream().synchronize();
+    handle_ptr_->get_stream().sync();
     // TODO: Is there any way to get nonzeros in the factors?
     // TODO: Is there any way to get flops for the factorization?
 
@@ -754,7 +851,7 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
       "cudaMemcpy for csr_values");
 
     CUDA_CALL_AND_CHECK(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
-    handle_ptr_->get_stream().synchronize();
+    handle_ptr_->get_stream().sync();
 
     CUDSS_CALL_AND_CHECK(
       cudssMatrixSetValues(A, csr_values_d), status, "cudssMatrixSetValues for A");
@@ -768,6 +865,8 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
 
     f_t numeric_time = toc(start_numeric);
     if (settings_.concurrent_halt != nullptr && *settings_.concurrent_halt == 1) {
+      RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+      handle_ptr_->get_stream().sync();
       return CONCURRENT_HALT_RETURN;
     }
 
@@ -778,7 +877,7 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
       status,
       "cudssDataGet for info");
     RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
-    handle_ptr_->get_stream().synchronize();
+    handle_ptr_->get_stream().sync();
     if (info != 0) {
       settings_.log.printf("Factorization failed info %d\n", info);
       return -1;
@@ -799,13 +898,13 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
   {
     auto d_b = cuopt::device_copy(b, handle_ptr_->get_stream());
     auto d_x = cuopt::device_copy(x, handle_ptr_->get_stream());
-    handle_ptr_->get_stream().synchronize();
+    handle_ptr_->get_stream().sync();
 
     i_t out = solve(d_b, d_x);
 
     raft::copy(x.data(), d_x.data(), d_x.size(), handle_ptr_->get_stream());
     // Sync so that data is on the host
-    handle_ptr_->get_stream().synchronize();
+    handle_ptr_->get_stream().sync();
 
     for (i_t i = 0; i < n; i++) {
       if (x[i] != x[i]) { return -1; }
@@ -816,7 +915,9 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
 
   i_t solve(rmm::device_uvector<f_t>& b, rmm::device_uvector<f_t>& x) override
   {
-    handle_ptr_->get_stream().synchronize();
+    // The green-context solver uses a separate stream; otherwise stream ordering suffices.
+    const bool separate_stream = stream != handle_ptr_->get_stream().get();
+    if (separate_stream) { handle_ptr_->get_stream().sync(); }
     if (static_cast<i_t>(b.size()) != n) {
       settings_.log.printf("Error: b.size() %d != n %d\n", b.size(), n);
       return -1;
@@ -833,6 +934,8 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
 
     status = cudssExecute(handle, CUDSS_PHASE_SOLVE, solverConfig, solverData, A, cudss_x, cudss_b);
     if (settings_.concurrent_halt != nullptr && *settings_.concurrent_halt == 1) {
+      RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+      handle_ptr_->get_stream().sync();
       return CONCURRENT_HALT_RETURN;
     }
     if (status != CUDSS_STATUS_SUCCESS) {
@@ -843,8 +946,9 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
       return -1;
     }
 
-    CUDA_CALL_AND_CHECK(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
-    handle_ptr_->get_stream().synchronize();
+    if (separate_stream) {
+      CUDA_CALL_AND_CHECK(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+    }
 
 #ifdef PRINT_RHS_AND_SOLUTION_HASH
     dense_vector_t<i_t, f_t> b_host(n);
@@ -875,7 +979,7 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
   bool positive_definite;
   cudaError_t cuda_error;
   cudssStatus_t status;
-  // rmm::cuda_stream_view stream;
+  // cuda::stream_ref stream;
   cudssHandle_t handle;
   cudssDeviceMemHandler_t mem_handler;
   cudssConfig_t solverConfig;
@@ -890,6 +994,7 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
   f_t* x_values_d;
   f_t* b_values_d;
 
+  bool symbolic_done_;
   const simplex::simplex_solver_settings_t<i_t, f_t>& settings_;
   CUgreenCtx barrier_green_ctx;
   CUstream stream;

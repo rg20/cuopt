@@ -370,6 +370,7 @@ void strong_branch_helper(i_t start,
       i_t iter                               = 0;
       std::vector<variable_status_t> vstatus = root_vstatus;
       std::vector<f_t> child_edge_norms      = edge_norms;
+      f_t child_work_estimate                = 0.0;
       dual_status_t status                   = simplex::dual_phase2(2,
                                                   0,
                                                   lp_start_time,
@@ -378,7 +379,8 @@ void strong_branch_helper(i_t start,
                                                   vstatus,
                                                   solution,
                                                   iter,
-                                                  child_edge_norms);
+                                                  child_edge_norms,
+                                                  child_work_estimate);
 
       f_t obj = std::numeric_limits<f_t>::quiet_NaN();
       if (status == dual_status_t::DUAL_UNBOUNDED) {
@@ -506,7 +508,8 @@ std::pair<f_t, dual_status_t> trial_branching(const lp_problem_t<i_t, f_t>& orig
   // Only refactor the basis if we encounter numerical issues.
   child_basis_factors.set_refactor_frequency(iter_limit);
 
-  dual_status_t status = simplex::dual_phase2_with_advanced_basis(2,
+  f_t child_work_estimate = 0.0;
+  dual_status_t status    = simplex::dual_phase2_with_advanced_basis(2,
                                                                   0,
                                                                   initialize_basis,
                                                                   start_time,
@@ -518,7 +521,8 @@ std::pair<f_t, dual_status_t> trial_branching(const lp_problem_t<i_t, f_t>& orig
                                                                   child_nonbasic_list,
                                                                   solution,
                                                                   iter,
-                                                                  child_edge_norms);
+                                                                  child_edge_norms,
+                                                                  child_work_estimate);
 
   settings.log.debug("Trial branching on variable %d. Lo: %e Up: %e. Iter %d. Status %s. Obj %e\n",
                      branch_var,
@@ -1040,7 +1044,7 @@ void strong_branching_reduced(const lp_problem_t<i_t, f_t>& original_lp,
   i_t effective_batch_pdlp = settings.mip_batch_pdlp_strong_branching;
 
   // Disable for sub MIP
-  if (settings.sub_mip) { effective_batch_pdlp = 0; }
+  if (settings.inside_submip) { effective_batch_pdlp = 0; }
 
   // Disable if running in deterministic mode
   if (settings.deterministic && settings.mip_batch_pdlp_strong_branching == 1) {
@@ -1053,7 +1057,7 @@ void strong_branching_reduced(const lp_problem_t<i_t, f_t>& original_lp,
   }
 
   if (settings.mip_batch_pdlp_strong_branching != 0 &&
-      (settings.sub_mip || settings.deterministic)) {
+      (settings.inside_submip || settings.deterministic)) {
     settings.log.printf(
       "Batch PDLP strong branching is disabled because sub-MIP or deterministic mode is enabled\n");
   }
@@ -1370,6 +1374,69 @@ void strong_branching(const lp_problem_t<i_t, f_t>& original_lp,
 }
 
 template <typename i_t, typename f_t>
+void pseudo_costs_t<i_t, f_t>::initialize_with_estimate(
+  const lp_problem_t<i_t, f_t>& lp,
+  const std::vector<simplex::variable_status_t>& vstatus,
+  const std::vector<i_t>& fractional,
+  const lp_solution_t<i_t, f_t>& lp_solution,
+  const std::vector<i_t>& basic_list,
+  const std::vector<i_t>& nonbasic_list,
+  basis_update_mpf_t<i_t, f_t>& basis_factors)
+{
+  i_t m = lp.num_rows;
+  i_t n = lp.num_cols;
+
+  std::vector<f_t> delta_z(n, 0);
+  std::vector<i_t> workspace(n, 0);
+
+  f_t work_estimate = 0;
+
+  std::vector<i_t> basic_map(n, -1);
+  for (i_t i = 0; i < m; i++) {
+    basic_map[basic_list[i]] = i;
+  }
+
+  // compute_initial_nonbasic_end permutes columns in place; copy so pc.Arow is unchanged
+  csr_matrix_t<i_t, f_t> local_Arow = Arow;
+
+  std::vector<i_t> nonbasic_end(m);
+  compute_initial_nonbasic_end(basic_map, local_Arow, nonbasic_end);
+
+  for (i_t k = 0; k < fractional.size(); k++) {
+    const i_t j = fractional[k];
+    assert(j >= 0);
+
+    if (pseudo_cost_num_up[j] == 0 || pseudo_cost_num_down[j] == 0) {
+      objective_change_estimate_t<f_t> estimate =
+        single_pivot_objective_change_estimate(lp,
+                                               settings,
+                                               local_Arow,
+                                               vstatus,
+                                               j,
+                                               basic_map[j],
+                                               lp_solution,
+                                               basic_list,
+                                               nonbasic_list,
+                                               nonbasic_end,
+                                               basis_factors,
+                                               workspace,
+                                               delta_z,
+                                               work_estimate);
+
+      if (pseudo_cost_num_down[j] == 0) {
+        pseudo_cost_sum_down[j] += estimate.down_obj_change;
+        ++pseudo_cost_num_down[j];
+      }
+
+      if (pseudo_cost_num_up[j] == 0) {
+        pseudo_cost_sum_up[j] += estimate.up_obj_change;
+        ++pseudo_cost_num_up[j];
+      }
+    }
+  }
+}
+
+template <typename i_t, typename f_t>
 inline f_t pseudo_costs_t<i_t, f_t>::compute_pseudocost_average_down()
 {
   i_t num_initialized = 0;
@@ -1423,6 +1490,10 @@ template <typename i_t, typename f_t>
 void pseudo_costs_t<i_t, f_t>::update_pseudo_costs(mip_node_t<i_t, f_t>* node_ptr,
                                                    f_t leaf_objective)
 {
+  // The root node carries no branching decision (branch_var < 0), so there is no variable to
+  // attribute the objective change to.
+  if (node_ptr->branch_var < 0) return;
+
   const f_t change_in_obj = std::max(leaf_objective - node_ptr->lower_bound, 0.0);
   const f_t frac          = node_ptr->branch_dir == branch_direction_t::DOWN
                               ? node_ptr->fractional_val - std::floor(node_ptr->fractional_val)
@@ -1489,7 +1560,7 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
   f_t avg_up{0};
   lp_solution_t<i_t, f_t>& leaf_solution = worker->leaf_solution;
 
-  const int64_t branch_and_bound_lp_iters = bnb_stats.total_lp_iters;
+  const int64_t branch_and_bound_lp_iters = bnb_stats.total_simplex_iters;
   const i_t branch_and_bound_lp_iter_per_node =
     bnb_stats.nodes_explored > 0 ? branch_and_bound_lp_iters / bnb_stats.nodes_explored : 0;
   const i_t iter_limit_per_trial = std::clamp(2 * branch_and_bound_lp_iter_per_node,
@@ -1567,7 +1638,7 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
   // Use the heuristic to decide if it should be used (in case it is set to automatic)
   if (!use_pdlp && rb_mode != 0) {
     // Check if it is a sub MIP or the determinism mode is on.
-    use_pdlp = !settings.sub_mip;
+    use_pdlp = !settings.inside_submip;
     use_pdlp &= !settings.deterministic;
 
     // Check if the warm cache was filled at the root
@@ -1587,7 +1658,7 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
   // Use the heuristic to decide if it should be used (in case it is set to automatic)
   if (!use_pdlp && rb_mode != 0) {
     // Check if it is a sub MIP or the determinism mode is on.
-    use_pdlp = !settings.sub_mip;
+    use_pdlp = !settings.inside_submip;
     use_pdlp &= !settings.deterministic;
 
     // Check if the warm cache was filled at the root
@@ -1603,7 +1674,7 @@ i_t pseudo_costs_t<i_t, f_t>::reliable_variable_selection(
 
   if (rb_mode != 0 && !pdlp_warm_cache->populated) {
     settings.log.debug("PDLP warm start data not populated, using DS only\n");
-  } else if (rb_mode != 0 && settings.sub_mip) {
+  } else if (rb_mode != 0 && settings.inside_submip) {
     settings.log.debug("Batch PDLP reliability branching is disabled because sub-MIP is enabled\n");
   } else if (rb_mode != 0 && settings.deterministic) {
     settings.log.debug(

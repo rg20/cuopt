@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved. # noqa
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 
@@ -7,7 +7,7 @@
 # cython: embedsignature = True
 # cython: language_level = 3
 
-from .data_model cimport data_model_view_t, mps_data_model_t, write_mps
+from .data_model cimport data_model_view_t, mps_data_model_t, write_lp, write_mps
 
 import warnings
 
@@ -20,6 +20,26 @@ from libcpp.memory cimport unique_ptr
 from libcpp.string cimport string
 from libcpp.utility cimport move
 from libcpp.vector cimport vector
+
+cdef extern from "Python.h":
+    bint PyCapsule_IsValid(object cap, const char* name)
+    void* PyCapsule_GetPointer(object cap, const char* name)
+
+cdef extern from "cuopt/mathematical_optimization/utilities/barrier_cache.hpp" namespace "cuopt::mathematical_optimization":  # noqa
+    cdef cppclass barrier_cache_t[i_t, f_t]:
+        void update_linear_objective(const f_t* c, i_t n) except +
+        void update_rhs(const f_t* b, i_t m) except +
+
+
+ctypedef fused _buffer_type:
+    double
+    int
+
+
+cdef inline uintptr_t _buffer_data_ptr(const _buffer_type[::1] array) except? 0:
+    if array is None:
+        raise TypeError("Expected an array, got None")
+    return <uintptr_t>&array[0]
 
 
 def type_cast(np_obj, np_type, name):
@@ -41,6 +61,7 @@ cdef class DataModel:
 
     def __init__(self):
         self.c_data_model_view.reset(new data_model_view_t[int, double]())
+        self.barrier_cache_capsule = None
 
         self.maximize = False
         self.A_values = np.array([])
@@ -157,6 +178,60 @@ cdef class DataModel:
 
     def set_objective_coefficients(self, c):
         self.c = type_cast(c, np.float64, "c")
+
+    def update_linear_objective(self, coefficients):
+        """Update linear objective coefficients on this DataModel.
+
+        Always writes the DataModel objective. If this model owns a solver
+        cache from a prior Barrier solve, also crushes ``coefficients`` into
+        the cached ``iteration_data_t`` and sets ``linear_objective_dirty``
+        so a later reuse can skip convert/presolve. Crush runs first so a
+        length error leaves the DataModel coefficients unchanged.
+        """
+        cdef barrier_cache_t[int, double]* cache
+        cdef double[::1] c_view
+        new_c = type_cast(coefficients, np.float64, "coefficients")
+        if self.barrier_cache_capsule is not None:
+            if not PyCapsule_IsValid(
+                self.barrier_cache_capsule, b"cuopt.barrier_cache"
+            ):
+                raise ValueError("Invalid barrier cache stored on DataModel.")
+            cache = <barrier_cache_t[int, double]*>PyCapsule_GetPointer(
+                self.barrier_cache_capsule,
+                b"cuopt.barrier_cache",
+            )
+            c_view = np.ascontiguousarray(new_c, dtype=np.float64)
+            if c_view.shape[0] == 0:
+                cache.update_linear_objective(<const double*>NULL, 0)
+            else:
+                cache.update_linear_objective(&c_view[0], <int>c_view.shape[0])
+        self.c = new_c
+
+    def update_rhs(self, b):
+        """Update constraint right-hand sides (user-space ``b``).
+
+        Always writes the DataModel RHS, and additionally crushes ``b`` into
+        the barrier cache when this model owns one. Crush runs first so a
+        length error leaves the DataModel RHS unchanged.
+        """
+        cdef barrier_cache_t[int, double]* cache
+        cdef double[::1] b_view
+        new_b = type_cast(b, np.float64, "b")
+        if self.barrier_cache_capsule is not None:
+            if not PyCapsule_IsValid(
+                self.barrier_cache_capsule, b"cuopt.barrier_cache"
+            ):
+                raise ValueError("Invalid barrier cache stored on DataModel.")
+            cache = <barrier_cache_t[int, double]*>PyCapsule_GetPointer(
+                self.barrier_cache_capsule,
+                b"cuopt.barrier_cache",
+            )
+            b_view = np.ascontiguousarray(new_b, dtype=np.float64)
+            if b_view.shape[0] == 0:
+                cache.update_rhs(<const double*>NULL, 0)
+            else:
+                cache.update_rhs(&b_view[0], <int>b_view.shape[0])
+        self.b = new_b
 
     def set_objective_scaling_factor(self, objective_scaling_factor):
         self.objective_scaling_factor = objective_scaling_factor
@@ -292,6 +367,9 @@ cdef class DataModel:
         return self.problem_name
 
     def set_data_model_view(self):
+        # Rebind from scratch so optional fields that were previously set but
+        # are now empty (e.g. Q after QP -> LP) do not stick in the C++ view.
+        self.c_data_model_view.reset(new data_model_view_t[int, double]())
         cdef data_model_view_t[int, double]* c_data_model_view = (
             self.c_data_model_view.get()
         )
@@ -306,7 +384,7 @@ cdef class DataModel:
         cdef uintptr_t c_A_offsets = (
             get_data_ptr(self.get_constraint_matrix_offsets())
         )
-        if self.get_constraint_matrix_values().shape[0] != 0 and self.get_constraint_matrix_indices().shape[0] != 0 and self.get_constraint_matrix_offsets().shape[0] != 0: # noqa
+        if self.get_constraint_matrix_offsets().shape[0] != 0:
             c_data_model_view.set_csr_constraint_matrix(
                 <const double *> c_A_values,
                 self.get_constraint_matrix_values().shape[0],
@@ -488,8 +566,8 @@ cdef class DataModel:
             qc.linear_values.resize(linear_nnz)
             qc.linear_indices.resize(linear_nnz)
             if linear_nnz > 0:
-                c_linear_values = get_data_ptr(item["linear_values"])
-                c_linear_indices = get_data_ptr(item["linear_indices"])
+                c_linear_values = _buffer_data_ptr[double](item["linear_values"])
+                c_linear_indices = _buffer_data_ptr[int](item["linear_indices"])
                 for i in range(linear_nnz):
                     qc.linear_values[i] = (<double*>c_linear_values)[i]
                     qc.linear_indices[i] = (<int*>c_linear_indices)[i]
@@ -499,9 +577,9 @@ cdef class DataModel:
             qc.rows.resize(quadratic_nnz)
             qc.cols.resize(quadratic_nnz)
             if quadratic_nnz > 0:
-                c_vals = get_data_ptr(item["vals"])
-                c_rows = get_data_ptr(item["rows"])
-                c_cols = get_data_ptr(item["cols"])
+                c_vals = _buffer_data_ptr[double](item["vals"])
+                c_rows = _buffer_data_ptr[int](item["rows"])
+                c_cols = _buffer_data_ptr[int](item["cols"])
                 for i in range(quadratic_nnz):
                     qc.vals[i] = (<double*>c_vals)[i]
                     qc.rows[i] = (<int*>c_rows)[i]
@@ -511,14 +589,29 @@ cdef class DataModel:
 
         c_data_model_view.set_quadratic_constraints(constraints)
 
-    def writeMPS(self, user_problem_file):
+    def _prepare_data_model_view_for_write(self):
         n_vars = self.get_variable_lower_bounds().shape[0]
-        if self.variable_types.shape[0] == 0 and n_vars > 0:
+        n_types = len(self.variable_types)
+        if n_types == 0 and n_vars > 0:
             self.variable_types = np.array(["C"] * n_vars, dtype="S1")
         else:
+            if n_types != 0 and n_types != n_vars:
+                raise ValueError(
+                    f"variable_types has {n_types} entries but the model has "
+                    f"{n_vars} variables; provide one type per variable or "
+                    "leave variable_types empty for all-continuous."
+                )
             self.variable_types = type_cast(
                 self.variable_types, "S1", "variable_types"
             )
         self.set_data_model_view()
+
+    def writeMPS(self, user_problem_file):
+        self._prepare_data_model_view_for_write()
         write_mps(self.c_data_model_view.get()[0],
                   user_problem_file.encode('utf-8'))
+
+    def _write_lp(self, user_problem_file):
+        self._prepare_data_model_view_for_write()
+        write_lp(self.c_data_model_view.get()[0],
+                 user_problem_file.encode('utf-8'))

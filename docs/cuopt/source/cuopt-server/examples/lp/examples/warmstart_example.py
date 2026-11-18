@@ -8,7 +8,7 @@ Warmstart allows reusing solution context from a previous solve to speed up
 solving of similar problems.
 
 Note:
-    Warmstart is only applicable to LP, not for MILP.
+    Warmstart is only applicable to LP, not for MIP.
 
 Important:
     To use warm start with PDLP, presolve must be explicitly disabled.
@@ -57,6 +57,7 @@ def main():
         "maximize": False,
         "solver_config": {
             "tolerances": {"optimality": 0.0001},
+            "method": 1,  # PDLP, the only method that uses warmstart
             "pdlp_solver_mode": 1,  # Stable2
             "presolve": 0,
         },

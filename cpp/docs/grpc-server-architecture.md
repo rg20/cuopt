@@ -89,7 +89,7 @@ All paths below are under `cpp/src/grpc/server/`.
 | File | Role |
 |------|------|
 | `grpc_server_main.cpp` | `main()`, argument parsing (via argparse), shared-memory init, gRPC server run/stop. |
-| `grpc_service_impl.cpp` | `CuOptRemoteServiceImpl`: all 14 RPC handlers (SubmitJob, CheckStatus, GetResult, StartChunkedUpload, SendArrayChunk, FinishChunkedUpload, StartChunkedDownload, GetResultChunk, FinishChunkedDownload, StreamLogs, GetIncumbents, CancelJob, DeleteResult, WaitForCompletion). Uses mappers and job_management to enqueue jobs and trigger pipe I/O. |
+| `grpc_service_impl.cpp` | `CuOptRemoteServiceImpl`: all 16 RPC handlers (SubmitJob, CheckStatus, GetResult, StartChunkedUpload, StartChunkedUploadV2, SendArrayChunk, FinishChunkedUpload, StartChunkedDownload, StartChunkedDownloadV2, GetResultChunk, FinishChunkedDownload, StreamLogs, GetIncumbents, CancelJob, DeleteResult, WaitForCompletion). Uses mappers and job_management to enqueue jobs and trigger pipe I/O. |
 | `grpc_server_types.hpp` | Shared structs (e.g. `JobQueueEntry`, `ResultQueueEntry`, `ServerConfig`, `JobInfo`), enums, globals (atomics, mutexes, condition variables), and forward declarations used across server .cpp files. |
 | `grpc_server_logger.hpp` | Server operational logger declaration (`server_logger()`, `init_server_logger()`) and `SERVER_LOG_*` convenience macros built on `rapids_logger`. Separate from the solver logger. |
 | `grpc_server_logger.cpp` | Server logger implementation: constructs a `rapids_logger::logger` with configurable console/file sinks and verbose/quiet levels. Created before `fork()` so both main and worker processes share the same output. |
@@ -111,7 +111,7 @@ For large problems uploaded via chunked gRPC RPCs:
 3. Worker reads the streamed messages from the pipe, reassembles arrays, runs the solver, and writes the result (and optionally incumbents) back via pipes using the same streaming format.
 4. Main process result-retrieval thread reads the streamed result messages from the pipe and stores the result for `GetResult` or chunked download.
 
-This streaming approach avoids creating a single large buffer, eliminating the 2 GiB protobuf serialization limit for pipe transfers and reducing peak memory usage. Each individual protobuf message (max 64 MiB) is serialized with standard `SerializeToArray`/`ParseFromArray`.
+This streaming approach avoids creating a single large buffer for the numeric arrays: those travel as raw bytes, not as one protobuf. A header protobuf is still serialized with `SerializeToArray`/`ParseFromArray`, so it is bounded by that API's `int` size. Problem size is limited at gRPC ingest (the configured max message size, which also bounds each chunk). The worker pipe rejects any single array larger than `kMaxPipeArrayBytes` (4 GiB).
 
 No disk spooling: chunked data is kept in memory in the main process until forwarded to the worker.
 
@@ -267,7 +267,7 @@ TLS Options:
 
 ### NVIDIA cuOpt container image
 
-When you use the official NVIDIA cuOpt container **without** an explicit command, the entrypoint chooses between the Python REST server and `cuopt_grpc_server`. User-facing Docker and client configuration is documented in `docs/cuopt/source/cuopt-grpc/advanced.rst` in this repository (the published **Advanced configuration** page).
+`CUOPT_SERVER_TYPE` always takes precedence and selects the server: `proxy` (HTTP proxy and `cuopt_grpc_server`), `grpc`, or `legacy`. When it is unset, the container command `proxy` (also the default when no command is given), `grpc`, or `legacy` selects the same servers. User-facing Docker and client configuration is documented in `docs/cuopt/source/cuopt-grpc/advanced.rst` in this repository (the published **Advanced configuration** page).
 
 When **`CUOPT_SERVER_TYPE=grpc`**, the entrypoint maps:
 
@@ -291,11 +291,23 @@ If a worker process crashes:
 
 ### Graceful Shutdown
 
-On SIGINT/SIGTERM:
-1. Set `shm_ctrl->shutdown_requested = true`
-2. Workers finish current job and exit
-3. Main process waits for workers
-4. Cleanup shared memory segments
+On SIGINT/SIGTERM (delivered to a dedicated `sigwait` thread — async `signal()`
+handlers are unreliable once gRPC/CUDA threads mask signals):
+1. Set `keep_running = false` and `shm_ctrl->shutdown_requested = true`
+2. Mark all queued/running jobs `CANCELLED` and wake any `WaitForCompletion` waiters
+3. `SIGKILL` all worker processes (mid-solve workers do not poll the shutdown flag)
+4. Shut down the gRPC server with a short deadline so lingering RPCs cannot block exit
+5. Join background threads (pipe I/O is interruptible via `shutdown_requested` +
+   `O_NONBLOCK`/`poll`; do **not** close pipe FDs while writers may still be in
+   `write()` — closing from another thread does not unblock an in-flight write)
+6. Close server-side worker pipes, wait briefly for workers (`waitpid` with a grace
+   period), and clean up shared memory
+7. A cancelable ~10s watchdog calls `_exit(1)` if the clean path wedges (e.g. GPU
+   driver D-state). The margin is above the bounded clean-path work (gRPC
+   Shutdown deadline + worker wait grace + thread joins). On a healthy
+   shutdown the watchdog is disarmed before process exit.
+
+Workers ignore SIGINT/SIGTERM so only the parent process owns shutdown; the parent always force-kills workers rather than waiting for the current solve to finish. Mid-CUDA workers can sit in uninterruptible D-state after `SIGKILL`, so `waitpid` is bounded — stragglers are abandoned for init/the test harness to reap.
 
 ### Job Cancellation
 
@@ -303,6 +315,8 @@ When `CancelJob` is called:
 1. Set `job_queue[slot].cancelled = true`
 2. If the job is **queued** (no worker yet): the worker checks the flag before starting and skips to the next job
 3. If the job is **running** (worker has claimed it): the worker process is killed with `SIGKILL`, the worker-monitor thread detects the exit and posts a `RESULT_CANCELLED` status, and a replacement worker is spawned automatically
+
+`DeleteResult` performs the same cancel for queued/running jobs, then removes all server-side state (tracker entry, pending payload, log file) so the job id is gone.
 
 ## Memory Management
 

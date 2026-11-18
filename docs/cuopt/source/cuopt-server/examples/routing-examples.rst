@@ -76,6 +76,9 @@ Initial Solution
 
 Previously run solutions or uploaded solutions can be used as the initial solution for new requests using previously run reqIds as follows:
 
+.. note::
+   This example uploads a solution, which is only supported by the :ref:`legacy HTTP server <legacy-http-server>`. The HTTP proxy server returns 501 for uploaded solutions. See :ref:`legacy-http-differences`.
+
 :download:`initial_solution_example.py <routing/examples/initial_solution_example.py>`
 
 .. literalinclude:: routing/examples/initial_solution_example.py
@@ -255,6 +258,9 @@ Uploading a Solution
 
 Users can also upload a solution which might have been saved for later runs.
 
+.. note::
+   Uploaded solutions are only supported by the :ref:`legacy HTTP server <legacy-http-server>`. The HTTP proxy server returns 501. See :ref:`legacy-http-differences`.
+
 .. code-block:: shell
 
    # Please update ip and port if the server is running on a different IP address or port
@@ -277,12 +283,12 @@ Users can also upload a solution which might have been saved for later runs.
 Aborting a Running Job In CLI
 -----------------------------
 
-Please refer to the :ref:`aborting-cli` for more in MILP Example.
+Please refer to the :ref:`aborting-cli` in the MIP examples for more details.
 
 .. note::
    Please use solver settings while using .mps files.
 
-To enable HTTPS
+To Enable HTTPS
 ----------------
 
 * In the case of the server using public certificates, simply enable https.

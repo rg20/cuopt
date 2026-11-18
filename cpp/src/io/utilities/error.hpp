@@ -6,7 +6,9 @@
 /* clang-format on */
 #pragma once
 
+#include <cstdlib>
 #include <string>
+#include <string_view>
 
 #include <stdarg.h>
 #include <stdexcept>
@@ -34,6 +36,48 @@ inline std::string error_to_string(error_type_t error)
   return std::string("UnAccountedError");
 }
 
+inline std::string json_escape(std::string_view value)
+{
+  constexpr char hex[] = "0123456789abcdef";
+  std::string escaped;
+  escaped.reserve(value.size());
+  for (unsigned char c : value) {
+    if (c < 0x20) {
+      escaped += "\\u00";
+      escaped += hex[c >> 4];
+      escaped += hex[c & 0xf];
+    } else {
+      if (c == '"' || c == '\\') { escaped += '\\'; }
+      escaped += c;
+    }
+  }
+  return escaped;
+}
+
+[[noreturn]] inline void mps_parser_throw(error_type_t error_type, const char* msg)
+{
+  throw std::logic_error("{\"MPS_PARSER_ERROR_TYPE\": \"" + error_to_string(error_type) +
+                         "\", \"msg\": \"" + json_escape(msg) + "\"}");
+}
+
+/**
+ * @brief Report an unrecoverable parser error.
+ *
+ * @param[error_type_t] error enum error type
+ * @param[const char *] fmt String format for error message
+ * @param variable set of arguments used for fmt
+ * @throw std::logic_error always
+ */
+[[noreturn]] inline void mps_parser_fail(error_type_t error_type, const char* fmt, ...)
+{
+  va_list args;
+  va_start(args, fmt);
+  char msg[2048];
+  vsnprintf(msg, sizeof(msg), fmt, args);
+  va_end(args);
+  mps_parser_throw(error_type, msg);
+}
+
 /**
  * @brief Function for checking (pre-)conditions that throws an exception when a
  * condition is false
@@ -52,9 +96,7 @@ inline void mps_parser_expects(bool cond, error_type_t error_type, const char* f
     char msg[2048];
     vsnprintf(msg, sizeof(msg), fmt, args);
     va_end(args);
-
-    throw std::logic_error("{\"MPS_PARSER_ERROR_TYPE\": \"" + error_to_string(error_type) +
-                           "\", \"msg\": " + "\"" + std::string(msg) + "\"}");
+    mps_parser_throw(error_type, msg);
   }
 }
 
@@ -104,16 +146,15 @@ inline void mps_parser_expects_fatal(bool cond, error_type_t error_type, const c
  * @param[in] fmt String literal description of the reason that cond is expected
  * to be true with optinal format tagas
  */
-#define mps_parser_no_except(statement, error_type, fmt, ...)                                 \
-  do {                                                                                        \
-    try {                                                                                     \
-      statement                                                                               \
-    } catch (...) {                                                                           \
-      std::string msg{};                                                                      \
-      MPS_PARSER_SET_ERROR_MSG(msg, "NVIDIA mps parser failure - ", fmt, ##__VA_ARGS__);      \
-      throw std::logic_error("{\"MPS_PARSER_ERROR_TYPE\": \"" + error_to_string(error_type) + \
-                             "\", \"msg\": " + "\"" + msg + "\"}");                           \
-    }                                                                                         \
+#define mps_parser_no_except(statement, error_type, fmt, ...)                            \
+  do {                                                                                   \
+    try {                                                                                \
+      statement                                                                          \
+    } catch (...) {                                                                      \
+      std::string msg{};                                                                 \
+      MPS_PARSER_SET_ERROR_MSG(msg, "NVIDIA mps parser failure - ", fmt, ##__VA_ARGS__); \
+      mps_parser_throw(error_type, msg.c_str());                                         \
+    }                                                                                    \
   } while (0)
 
 }  // namespace cuopt::mathematical_optimization::io

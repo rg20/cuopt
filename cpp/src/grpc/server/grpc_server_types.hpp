@@ -17,6 +17,7 @@
 #include <cuopt/mathematical_optimization/optimization_problem_interface.hpp>
 #include <cuopt/mathematical_optimization/solve.hpp>
 #include <cuopt/mathematical_optimization/utilities/internals.hpp>
+#include "grpc_job_queue.hpp"
 #include "grpc_problem_mapper.hpp"
 #include "grpc_server_logger.hpp"
 #include "grpc_settings_mapper.hpp"
@@ -83,19 +84,6 @@ void copy_cstr(char (&dst)[N], const char* src)
   std::snprintf(dst, N, "%s", src ? src : "");
 }
 
-struct JobQueueEntry {
-  char job_id[64];
-  uint32_t problem_category;      // cuopt::remote::ProblemCategory (LP, MIP, ...)
-  uint64_t data_size;             // Size of problem data (uint64 for large problems)
-  std::atomic<bool> ready;        // Job is ready to be processed
-  std::atomic<bool> claimed;      // Worker has claimed this job
-  std::atomic<pid_t> worker_pid;  // PID of worker that claimed this job (0 if none)
-  std::atomic<bool> cancelled;    // Job has been cancelled (worker should skip)
-  std::atomic<int> worker_index;  // Index of worker that claimed this job (-1 if none)
-  std::atomic<bool> data_sent;    // Server has sent data to worker's pipe
-  std::atomic<bool> is_chunked;   // True when data is in pending_chunked_data (streamed to pipe)
-};
-
 enum ResultStatus : uint32_t {
   RESULT_SUCCESS   = 0,
   RESULT_ERROR     = 1,
@@ -107,7 +95,7 @@ struct ResultQueueEntry {
   ResultStatus status;
   uint64_t data_size;  // Size of result data (uint64 for large results)
   char error_message[1024];
-  std::atomic<bool> claimed;      // CAS guard: prevents two forked workers from
+  std::atomic<bool> claimed;      // CAS guard: prevents two workers from
                                   // writing the same slot simultaneously.
   std::atomic<bool> ready;        // Result is ready for reading (published last).
   std::atomic<bool> retrieved;    // Result has been retrieved
@@ -127,6 +115,7 @@ enum class JobStatus { QUEUED, PROCESSING, COMPLETED, FAILED, NOT_FOUND, CANCELL
 
 struct IncumbentEntry {
   double objective = 0.0;
+  double bound     = 0.0;
   std::vector<double> assignment;
 };
 
@@ -204,7 +193,9 @@ static constexpr int kSessionTimeoutSeconds = 300;
 
 struct ChunkedUploadState {
   uint32_t problem_category = cuopt::remote::LP;
+  bool unified              = false;
   cuopt::remote::ChunkedProblemHeader header;
+  cuopt::remote::SubmitJobRequest job;
   struct FieldMeta {
     int64_t total_elements = 0;
     int64_t element_size   = 0;
@@ -226,7 +217,9 @@ struct ChunkedUploadState {
 
 // Holds header + chunks for a chunked upload, ready to stream to the worker pipe.
 struct PendingChunkedUpload {
+  bool unified = false;
   cuopt::remote::ChunkedProblemHeader header;
+  cuopt::remote::SubmitJobRequest job;
   std::vector<cuopt::remote::ArrayChunk> chunks;
 };
 
@@ -235,6 +228,7 @@ struct PendingChunkedUpload {
 // =============================================================================
 
 inline std::atomic<bool> keep_running{true};
+inline std::atomic<bool> fatal_worker_failure{false};
 inline std::map<std::string, JobInfo> job_tracker;
 inline std::mutex tracker_mutex;
 inline std::condition_variable result_cv;
@@ -245,8 +239,19 @@ inline std::mutex waiters_mutex;
 inline JobQueueEntry* job_queue       = nullptr;
 inline ResultQueueEntry* result_queue = nullptr;
 inline SharedMemoryControl* shm_ctrl  = nullptr;
+// Parent-process only: assigns enqueue_seq when accepting a job. Starts at 1 so
+// 0 remains the sentinel for free/reset slots. job_enqueue_mutex is held from
+// the ticket assignment until ready is published, so a later ticket cannot
+// become visible before an earlier one.
+inline std::atomic<uint64_t> next_job_enqueue_seq{1};
+inline std::mutex job_enqueue_mutex;
+// Per-slot ready flags: child sets after CUDA/RMM init and the startup GPU
+// probe. Parent clears before a respawn and waits for the new child to publish.
+// Sized to config.num_workers; do not use active_workers (SIGKILL leaves it stale).
+inline std::atomic<bool>* worker_ready_flags = nullptr;
 
 inline std::vector<pid_t> worker_pids;
+inline std::mutex worker_pids_mutex;
 
 inline ServerConfig config;
 
@@ -276,11 +281,21 @@ inline std::string make_shm_name(const char* base)
 inline std::string SHM_JOB_QUEUE    = make_shm_name("/cuopt_job_queue");
 inline std::string SHM_RESULT_QUEUE = make_shm_name("/cuopt_result_queue");
 inline std::string SHM_CONTROL      = make_shm_name("/cuopt_control");
+inline std::string SHM_WORKER_READY = make_shm_name("/cuopt_worker_ready");
 
 inline const std::string LOG_DIR = "/tmp/cuopt_logs";
 
 constexpr int64_t kMiB = 1024LL * 1024;
 constexpr int64_t kGiB = 1024LL * 1024 * 1024;
+
+// Distinguishes a fatal CUDA/RMM health failure from ordinary worker exits
+// such as the SIGKILL used to cancel a running job.
+constexpr int kGpuUnhealthyExitCode = 86;
+
+// Worker exec started, then failed before it could attach to the parent's
+// shared memory or pipes (bad internal arguments, missing segment). Respawning
+// cannot succeed, so the monitor shuts the server down instead of retrying.
+constexpr int kWorkerAttachFailedExitCode = 87;
 
 // Floor: 4 KiB is enough for basic gRPC control messages. Values below this
 // would risk rejecting even metadata-only RPCs like CheckStatus.
@@ -330,13 +345,8 @@ inline std::string read_file_to_string(const std::string& path)
 // Signal handling
 // =============================================================================
 
-inline void signal_handler(int signal)
-{
-  if (signal == SIGINT || signal == SIGTERM) {
-    keep_running = false;
-    if (shm_ctrl) { shm_ctrl->shutdown_requested = true; }
-  }
-}
+// SIGINT/SIGTERM are handled via sigwait on a dedicated thread (see main).
+// Using signal() handlers is unreliable once gRPC/CUDA threads mask signals.
 
 // =============================================================================
 // Forward declarations
@@ -350,7 +360,10 @@ void cleanup_shared_memory();
 void log_worker_gpu_layout();
 bool init_worker_cuda_environment(int worker_id);
 void spawn_workers();
+void kill_all_workers();
+void close_all_server_worker_pipes();
 void wait_for_workers();
+void cancel_all_active_jobs_for_shutdown();
 void worker_monitor_thread();
 void result_retrieval_thread();
 void incumbent_retrieval_thread();
@@ -363,7 +376,9 @@ bool recv_job_data_pipe(int fd, uint64_t expected_size, std::vector<uint8_t>& da
 bool send_incumbent_pipe(int fd, const std::vector<uint8_t>& data);
 bool recv_incumbent_pipe(int fd, std::vector<uint8_t>& data);
 
-void worker_process(int worker_id);
+void worker_process(int worker_id, bool is_replacement);
+// Entry point for a worker created by posix_spawn/exec. Not a server.
+int run_spawned_worker(int argc, char** argv);
 pid_t spawn_single_worker(int worker_id);
 void mark_worker_jobs_failed(pid_t dead_worker_pid);
 
@@ -373,5 +388,7 @@ std::pair<bool, std::string> submit_chunked_job_async(PendingChunkedUpload&& chu
                                                       uint32_t problem_category);
 JobStatus check_job_status(const std::string& job_id, std::string& message);
 int cancel_job(const std::string& job_id, JobStatus& job_status_out, std::string& message);
+// Cancel if queued/running, then remove all server-side state for the job.
+bool delete_job(const std::string& job_id, std::string& message);
 
 #endif  // CUOPT_ENABLE_GRPC

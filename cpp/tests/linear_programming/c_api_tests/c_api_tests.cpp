@@ -7,25 +7,28 @@
 
 #include "c_api_tests.h"
 
+#include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include <cuopt/mathematical_optimization/cuopt_c.h>
 #include <pdlp/cuopt_c_internal.hpp>
 
 #include <cuda_runtime.h>
+#include <cusparse.h>
 
 #include <utilities/common_utils.hpp>
 #include <utilities/error.hpp>
 
-namespace cuopt::mathematical_optimization::pdlp {
-bool is_cusparse_runtime_mixed_precision_supported();
-}
-
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
+
+using ::testing::ElementsAreArray;
 
 TEST(c_api, int_size) { EXPECT_EQ(test_int_size(), sizeof(int32_t)); }
 
@@ -79,7 +82,7 @@ INSTANTIATE_TEST_SUITE_P(
   TimeLimitTestFixture,
   ::testing::Values(
     std::make_tuple("/linear_programming/square41/square41.mps",
-                    5,
+                    2,
                     CUOPT_METHOD_DUAL_SIMPLEX),  // LP, Dual Simplex
     std::make_tuple("/linear_programming/square41/square41.mps", 5, CUOPT_METHOD_PDLP),  // LP, PDLP
     std::make_tuple("/mip/supportcase22.mps", 15, CUOPT_METHOD_DUAL_SIMPLEX)             // MIP
@@ -112,6 +115,15 @@ TEST(c_api, bad_parameter_name) { EXPECT_EQ(test_bad_parameter_name(), CUOPT_INV
 TEST(c_api, mip_get_callbacks_only) { EXPECT_EQ(test_mip_get_callbacks_only(), CUOPT_SUCCESS); }
 
 TEST(c_api, mip_get_set_callbacks) { EXPECT_EQ(test_mip_get_set_callbacks(), CUOPT_SUCCESS); }
+
+TEST(c_api, log_callback) { EXPECT_EQ(test_log_callback(), CUOPT_SUCCESS); }
+
+TEST(c_api, log_callback_cleared) { EXPECT_EQ(test_log_callback_cleared(), CUOPT_SUCCESS); }
+
+TEST(c_api, log_callback_not_leaked_across_solves)
+{
+  EXPECT_EQ(test_log_callback_not_leaked_across_solves(), CUOPT_SUCCESS);
+}
 
 TEST(c_api, burglar) { EXPECT_EQ(burglar_problem(), CUOPT_SUCCESS); }
 
@@ -318,7 +330,7 @@ TEST(c_api, test_maximize_problem_dual_variables)
   }
 }
 
-static bool test_mps_roundtrip(const std::string& mps_file_path)
+static bool test_write_roundtrip(const std::string& mps_file_path, cuopt_int_t format)
 {
   using cuopt::mathematical_optimization::problem_and_stream_view_t;
 
@@ -326,23 +338,23 @@ static bool test_mps_roundtrip(const std::string& mps_file_path)
   cuOptOptimizationProblem reread_handle   = nullptr;
   bool result                              = false;
 
-  std::string model_basename = std::filesystem::path(mps_file_path).filename().string();
+  const std::string extension = (format == CUOPT_FILE_FORMAT_LP) ? ".lp" : ".mps";
+  std::string model_basename  = std::filesystem::path(mps_file_path).stem().string() + extension;
   std::string temp_file =
     std::filesystem::temp_directory_path().string() + "/roundtrip_temp_" + model_basename;
 
   if (cuOptReadProblem(mps_file_path.c_str(), &original_handle) != CUOPT_SUCCESS) {
-    std::cerr << "Failed to read original MPS file: " << mps_file_path << std::endl;
+    std::cerr << "Failed to read original problem file: " << mps_file_path << std::endl;
     goto cleanup;
   }
 
-  if (cuOptWriteProblem(original_handle, temp_file.c_str(), CUOPT_FILE_FORMAT_MPS) !=
-      CUOPT_SUCCESS) {
-    std::cerr << "Failed to write MPS file: " << temp_file << std::endl;
+  if (cuOptWriteProblem(original_handle, temp_file.c_str(), format) != CUOPT_SUCCESS) {
+    std::cerr << "Failed to write problem file: " << temp_file << std::endl;
     goto cleanup;
   }
 
   if (cuOptReadProblem(temp_file.c_str(), &reread_handle) != CUOPT_SUCCESS) {
-    std::cerr << "Failed to re-read MPS file: " << temp_file << std::endl;
+    std::cerr << "Failed to re-read problem file: " << temp_file << std::endl;
     goto cleanup;
   }
 
@@ -367,7 +379,7 @@ class WriteRoundtripTestFixture : public ::testing::TestWithParam<std::string> {
 TEST_P(WriteRoundtripTestFixture, roundtrip)
 {
   const std::string& rapidsDatasetRootDir = cuopt::test::get_rapids_dataset_root_dir();
-  EXPECT_TRUE(test_mps_roundtrip(rapidsDatasetRootDir + GetParam()));
+  EXPECT_TRUE(test_write_roundtrip(rapidsDatasetRootDir + GetParam(), CUOPT_FILE_FORMAT_MPS));
 }
 INSTANTIATE_TEST_SUITE_P(c_api,
                          WriteRoundtripTestFixture,
@@ -398,6 +410,20 @@ INSTANTIATE_TEST_SUITE_P(c_api,
                                            "/mip/enlight_hard.mps",
                                            "/mip/enlight11.mps",
                                            "/mip/supportcase22.mps"));
+
+class LPWriteRoundtripTestFixture : public ::testing::TestWithParam<std::string> {};
+TEST_P(LPWriteRoundtripTestFixture, roundtrip)
+{
+  const std::string& rapidsDatasetRootDir = cuopt::test::get_rapids_dataset_root_dir();
+  EXPECT_TRUE(test_write_roundtrip(rapidsDatasetRootDir + GetParam(), CUOPT_FILE_FORMAT_LP));
+}
+INSTANTIATE_TEST_SUITE_P(c_api,
+                         LPWriteRoundtripTestFixture,
+                         ::testing::Values("/linear_programming/afiro_original.mps",
+                                           "/mip/50v-10.mps",
+                                           "/mip/gen-ip054.mps",
+                                           "/mip/neos5.mps",
+                                           "/mip/stein9inf.mps"));
 
 class DeterministicBBTestFixture
   : public ::testing::TestWithParam<std::tuple<std::string, int, double, double>> {};
@@ -441,23 +467,35 @@ TEST(c_api, pdlp_precision_single)
 
 TEST(c_api, pdlp_precision_mixed)
 {
-  using namespace cuopt::mathematical_optimization::pdlp;
   const std::string& rapidsDatasetRootDir = cuopt::test::get_rapids_dataset_root_dir();
   std::string filename           = rapidsDatasetRootDir + "/linear_programming/afiro_original.mps";
   cuopt_int_t termination_status = -1;
   cuopt_float_t objective;
-  if (!cuopt::mathematical_optimization::pdlp::is_cusparse_runtime_mixed_precision_supported()) {
-    auto status = test_pdlp_precision_mixed(filename.c_str(), &termination_status, &objective);
-    bool solve_returned_error = (status != CUOPT_SUCCESS);
-    bool solve_returned_non_optimal =
-      (status == CUOPT_SUCCESS && termination_status != CUOPT_TERMINATION_STATUS_OPTIMAL);
-    EXPECT_TRUE(solve_returned_error || solve_returned_non_optimal);
-    return;
+  // Mixed-precision SpMV (FP32 matrix × FP64 vector) requires cuSPARSE >= 12.5 at BOTH
+  // compile time (header) and runtime (loaded .so). The header version (#if) guards symbol
+  // availability; the runtime check below mirrors is_cusparse_runtime_mixed_precision_supported().
+#if CUSPARSE_VERSION >= 12500
+  int cusparseMajor = 0, cusparseMinor = 0;
+  cusparseGetProperty(MAJOR_VERSION, &cusparseMajor);
+  cusparseGetProperty(MINOR_VERSION, &cusparseMinor);
+  bool runtimeSupported = (cusparseMajor > 12) || (cusparseMajor == 12 && cusparseMinor >= 5);
+  if (runtimeSupported) {
+    EXPECT_EQ(test_pdlp_precision_mixed(filename.c_str(), &termination_status, &objective),
+              CUOPT_SUCCESS);
+    EXPECT_EQ(termination_status, CUOPT_TERMINATION_STATUS_OPTIMAL);
+    EXPECT_NEAR(objective, -464.7531, 1e-1);
+  } else {
+    // cuopt_expects throws ValidationError when mixed precision is requested without runtime
+    // support, so the C API always returns an error code — never CUOPT_SUCCESS.
+    EXPECT_NE(test_pdlp_precision_mixed(filename.c_str(), &termination_status, &objective),
+              CUOPT_SUCCESS);
   }
-  EXPECT_EQ(test_pdlp_precision_mixed(filename.c_str(), &termination_status, &objective),
+#else
+  // cuopt_expects throws ValidationError when mixed precision is requested without support,
+  // so the C API always returns an error code — never CUOPT_SUCCESS.
+  EXPECT_NE(test_pdlp_precision_mixed(filename.c_str(), &termination_status, &objective),
             CUOPT_SUCCESS);
-  EXPECT_EQ(termination_status, CUOPT_TERMINATION_STATUS_OPTIMAL);
-  EXPECT_NEAR(objective, -464.7531, 1e-1);
+#endif
 }
 
 // =============================================================================
@@ -467,6 +505,11 @@ TEST(c_api, pdlp_precision_mixed)
 TEST(c_api, lp_solution_mip_methods) { EXPECT_EQ(test_lp_solution_mip_methods(), CUOPT_SUCCESS); }
 
 TEST(c_api, mip_solution_lp_methods) { EXPECT_EQ(test_mip_solution_lp_methods(), CUOPT_SUCCESS); }
+
+TEST(c_api, qcqp_solution_dual_methods)
+{
+  EXPECT_EQ(test_qcqp_solution_dual_methods(), CUOPT_SUCCESS);
+}
 
 // =============================================================================
 // CPU-Only Execution Tests
@@ -761,6 +804,13 @@ TEST_F(CpuOnlyWithServerTest, lp_solve)
   EXPECT_EQ(test_cpu_only_execution(lp_file.c_str()), CUOPT_SUCCESS);
 }
 
+TEST_F(CpuOnlyWithServerTest, log_callback_remote)
+{
+  const std::string& rapidsDatasetRootDir = cuopt::test::get_rapids_dataset_root_dir();
+  std::string lp_file = rapidsDatasetRootDir + "/linear_programming/afiro_original.mps";
+  EXPECT_EQ(test_log_callback_remote(lp_file.c_str()), CUOPT_SUCCESS);
+}
+
 TEST_F(CpuOnlyWithServerTest, mip_solve)
 {
   const std::string& rapidsDatasetRootDir = cuopt::test::get_rapids_dataset_root_dir();
@@ -780,5 +830,849 @@ TEST(c_api, gpu_problem_rejects_remote_after_create)
   EXPECT_EQ(test_gpu_problem_remote_after_create(lp_file.c_str()), CUOPT_SUCCESS);
 }
 
+// Attribute getters are checked against the exact values passed to the cuOptCreate* / cuOptSet*
+// interfaces. cuOptReadProblem is used only for variable/row names, which no create/set routine
+// sets.
+TEST(c_api, problem_attributes_created)
+{
+  // A small mixed-integer LP, built by hand so every getter can be compared to a known value:
+  //   A = [ 1 0 2 ]  sense L, rhs 10     min 5 + [1,2,3].x     var types [I,C,I]
+  //       [ 0 3 4 ]  sense G, rhs 20
+  const cuopt_int_t num_constraints             = 2;
+  const cuopt_int_t num_variables               = 3;
+  const cuopt_int_t nnz                         = 4;
+  const cuopt_float_t objective_offset          = 5.0;
+  const cuopt_float_t objective_coefficients[3] = {1.0, 2.0, 3.0};
+  const cuopt_int_t row_offsets[3]              = {0, 2, 4};
+  const cuopt_int_t col_indices[4]              = {0, 2, 1, 2};
+  const cuopt_float_t matrix_values[4]          = {1.0, 2.0, 3.0, 4.0};
+  const char constraint_sense[2]                = {CUOPT_LESS_THAN, CUOPT_GREATER_THAN};
+  const cuopt_float_t rhs[2]                    = {10.0, 20.0};
+  const cuopt_float_t lower_bounds[3]           = {0.0, 0.0, 0.0};
+  const cuopt_float_t upper_bounds[3]           = {100.0, 100.0, 100.0};
+  const char variable_types[3]                  = {CUOPT_INTEGER, CUOPT_CONTINUOUS, CUOPT_INTEGER};
+
+  // CSC is the transpose of the CSR above, written out by hand for a direct comparison.
+  const cuopt_int_t csc_offsets[4]     = {0, 1, 2, 4};
+  const cuopt_int_t csc_row_indices[4] = {0, 1, 0, 1};
+  const cuopt_float_t csc_values[4]    = {1.0, 3.0, 2.0, 4.0};
+
+  cuOptOptimizationProblem problem = nullptr;
+  ASSERT_EQ(cuOptCreateProblem(num_constraints,
+                               num_variables,
+                               CUOPT_MINIMIZE,
+                               objective_offset,
+                               objective_coefficients,
+                               row_offsets,
+                               col_indices,
+                               matrix_values,
+                               constraint_sense,
+                               rhs,
+                               lower_bounds,
+                               upper_bounds,
+                               variable_types,
+                               &problem),
+            CUOPT_SUCCESS);
+
+  auto get_int = [&](cuopt_int_t attr) {
+    cuopt_int_t v = -1;
+    EXPECT_EQ(cuOptGetProblemIntAttribute(problem, attr, &v), CUOPT_SUCCESS);
+    return v;
+  };
+  auto get_float = [&](cuopt_int_t attr) {
+    cuopt_float_t v = 0.0;
+    EXPECT_EQ(cuOptGetProblemFloatAttribute(problem, attr, &v), CUOPT_SUCCESS);
+    return v;
+  };
+
+  EXPECT_EQ(get_int(CUOPT_ATTR_NUM_VARIABLES), num_variables);
+  EXPECT_EQ(get_int(CUOPT_ATTR_NUM_CONSTRAINTS), num_constraints);
+  EXPECT_EQ(get_int(CUOPT_ATTR_NUM_NONZEROS), nnz);
+  EXPECT_EQ(get_int(CUOPT_ATTR_NUM_INTEGERS), 2);
+  EXPECT_EQ(get_int(CUOPT_ATTR_PROBLEM_CATEGORY), 1 /* MIP */);
+  EXPECT_EQ(get_int(CUOPT_ATTR_IS_MIP), 1);
+  EXPECT_EQ(get_int(CUOPT_ATTR_HAS_QUADRATIC_OBJECTIVE), 0);
+  EXPECT_EQ(get_int(CUOPT_ATTR_HAS_QUADRATIC_CONSTRAINTS), 0);
+  EXPECT_EQ(get_int(CUOPT_ATTR_OBJECTIVE_SENSE), CUOPT_MINIMIZE);
+  EXPECT_EQ(get_float(CUOPT_ATTR_OBJECTIVE_OFFSET), objective_offset);
+  EXPECT_EQ(get_float(CUOPT_ATTR_OBJECTIVE_SCALING_FACTOR), 1.0);  // create leaves the default of 1
+
+  std::vector<cuopt_float_t> fbuf(num_variables);
+  EXPECT_EQ(cuOptGetProblemFloatArrayAttribute(
+              problem, CUOPT_ARRAY_ATTR_OBJECTIVE_COEFFICIENTS, fbuf.data(), num_variables),
+            CUOPT_SUCCESS);
+  EXPECT_THAT(fbuf, ElementsAreArray(objective_coefficients));
+  EXPECT_EQ(cuOptGetProblemFloatArrayAttribute(
+              problem, CUOPT_ARRAY_ATTR_VARIABLE_LOWER_BOUNDS, fbuf.data(), num_variables),
+            CUOPT_SUCCESS);
+  EXPECT_THAT(fbuf, ElementsAreArray(lower_bounds));
+  EXPECT_EQ(cuOptGetProblemFloatArrayAttribute(
+              problem, CUOPT_ARRAY_ATTR_VARIABLE_UPPER_BOUNDS, fbuf.data(), num_variables),
+            CUOPT_SUCCESS);
+  EXPECT_THAT(fbuf, ElementsAreArray(upper_bounds));
+
+  std::vector<cuopt_float_t> rhs_buf(num_constraints);
+  EXPECT_EQ(cuOptGetProblemFloatArrayAttribute(
+              problem, CUOPT_ARRAY_ATTR_CONSTRAINT_RHS, rhs_buf.data(), num_constraints),
+            CUOPT_SUCCESS);
+  EXPECT_THAT(rhs_buf, ElementsAreArray(rhs));
+
+  std::vector<char> sense_buf(num_constraints);
+  EXPECT_EQ(cuOptGetProblemCharArrayAttribute(
+              problem, CUOPT_ARRAY_ATTR_CONSTRAINT_SENSE, sense_buf.data(), num_constraints),
+            CUOPT_SUCCESS);
+  EXPECT_THAT(sense_buf, ElementsAreArray(constraint_sense));
+  std::vector<char> type_buf(num_variables);
+  EXPECT_EQ(cuOptGetProblemCharArrayAttribute(
+              problem, CUOPT_ARRAY_ATTR_VARIABLE_TYPES, type_buf.data(), num_variables),
+            CUOPT_SUCCESS);
+  EXPECT_THAT(type_buf, ElementsAreArray(variable_types));
+
+  // CSR getter must return exactly the matrix we created with.
+  std::vector<cuopt_int_t> csr_off(num_constraints + 1), csr_col(nnz);
+  std::vector<cuopt_float_t> csr_val(nnz);
+  EXPECT_EQ(cuOptGetConstraintMatrixCSR(problem, csr_off.data(), csr_col.data(), csr_val.data()),
+            CUOPT_SUCCESS);
+  EXPECT_THAT(csr_off, ElementsAreArray(row_offsets));
+  EXPECT_THAT(csr_col, ElementsAreArray(col_indices));
+  EXPECT_THAT(csr_val, ElementsAreArray(matrix_values));
+
+  // CSC getter returns the transpose; compare against the hand-written expected layout.
+  std::vector<cuopt_int_t> csc_off(num_variables + 1), csc_row(nnz);
+  std::vector<cuopt_float_t> csc_val(nnz);
+  EXPECT_EQ(cuOptGetConstraintMatrixCSC(problem, csc_off.data(), csc_row.data(), csc_val.data()),
+            CUOPT_SUCCESS);
+  EXPECT_THAT(csc_off, ElementsAreArray(csc_offsets));
+  EXPECT_THAT(csc_row, ElementsAreArray(csc_row_indices));
+  EXPECT_THAT(csc_val, ElementsAreArray(csc_values));
+
+  // Names are not set by create; requesting them must be rejected.
+  const char* names[3] = {nullptr, nullptr, nullptr};
+  EXPECT_EQ(cuOptGetProblemStringArrayAttribute(
+              problem, CUOPT_STRING_ARRAY_VARIABLE_NAMES, names, num_variables),
+            CUOPT_INVALID_ARGUMENT);
+
+  cuOptDestroyProblem(&problem);
+}
+
+// Ranged rows can only be built with cuOptCreateRangedProblem, so it is the only path that sets the
+// constraint lower/upper bound attributes.
+TEST(c_api, problem_attributes_ranged)
+{
+  const cuopt_int_t num_constraints              = 2;
+  const cuopt_int_t num_variables                = 2;
+  const cuopt_float_t objective_coefficients[2]  = {1.0, 1.0};
+  const cuopt_int_t row_offsets[3]               = {0, 2, 3};
+  const cuopt_int_t col_indices[3]               = {0, 1, 0};
+  const cuopt_float_t matrix_values[3]           = {1.0, 1.0, 1.0};
+  const cuopt_float_t constraint_lower_bounds[2] = {1.0, 0.0};
+  const cuopt_float_t constraint_upper_bounds[2] = {10.0, 5.0};
+  const cuopt_float_t variable_lower_bounds[2]   = {0.0, 0.0};
+  const cuopt_float_t variable_upper_bounds[2]   = {100.0, 100.0};
+  const char variable_types[2]                   = {CUOPT_CONTINUOUS, CUOPT_CONTINUOUS};
+
+  cuOptOptimizationProblem problem = nullptr;
+  ASSERT_EQ(cuOptCreateRangedProblem(num_constraints,
+                                     num_variables,
+                                     CUOPT_MINIMIZE,
+                                     0.0,
+                                     objective_coefficients,
+                                     row_offsets,
+                                     col_indices,
+                                     matrix_values,
+                                     constraint_lower_bounds,
+                                     constraint_upper_bounds,
+                                     variable_lower_bounds,
+                                     variable_upper_bounds,
+                                     variable_types,
+                                     &problem),
+            CUOPT_SUCCESS);
+
+  std::vector<cuopt_float_t> buf(num_constraints);
+  EXPECT_EQ(cuOptGetProblemFloatArrayAttribute(
+              problem, CUOPT_ARRAY_ATTR_CONSTRAINT_LOWER_BOUNDS, buf.data(), num_constraints),
+            CUOPT_SUCCESS);
+  EXPECT_THAT(buf, ElementsAreArray(constraint_lower_bounds));
+  EXPECT_EQ(cuOptGetProblemFloatArrayAttribute(
+              problem, CUOPT_ARRAY_ATTR_CONSTRAINT_UPPER_BOUNDS, buf.data(), num_constraints),
+            CUOPT_SUCCESS);
+  EXPECT_THAT(buf, ElementsAreArray(constraint_upper_bounds));
+
+  cuOptDestroyProblem(&problem);
+}
+
+// The quadratic-presence flags flip only after cuOptSetQuadraticObjective /
+// cuOptAddQuadraticConstraint.
+TEST(c_api, problem_attributes_quadratic)
+{
+  const cuopt_int_t num_constraints             = 1;
+  const cuopt_int_t num_variables               = 2;
+  const cuopt_float_t objective_coefficients[2] = {1.0, 1.0};
+  const cuopt_int_t row_offsets[2]              = {0, 2};
+  const cuopt_int_t col_indices[2]              = {0, 1};
+  const cuopt_float_t matrix_values[2]          = {1.0, 1.0};
+  const char constraint_sense[1]                = {CUOPT_LESS_THAN};
+  const cuopt_float_t rhs[1]                    = {10.0};
+  const cuopt_float_t lower_bounds[2]           = {0.0, 0.0};
+  const cuopt_float_t upper_bounds[2]           = {100.0, 100.0};
+  const char variable_types[2]                  = {CUOPT_CONTINUOUS, CUOPT_CONTINUOUS};
+
+  cuOptOptimizationProblem problem = nullptr;
+  ASSERT_EQ(cuOptCreateProblem(num_constraints,
+                               num_variables,
+                               CUOPT_MINIMIZE,
+                               0.0,
+                               objective_coefficients,
+                               row_offsets,
+                               col_indices,
+                               matrix_values,
+                               constraint_sense,
+                               rhs,
+                               lower_bounds,
+                               upper_bounds,
+                               variable_types,
+                               &problem),
+            CUOPT_SUCCESS);
+
+  // Fresh sentinel-initialized read on every call, so a getter that fails to write is always
+  // caught.
+  auto get_int = [&](cuopt_int_t attr) {
+    cuopt_int_t v = -1;
+    EXPECT_EQ(cuOptGetProblemIntAttribute(problem, attr, &v), CUOPT_SUCCESS);
+    return v;
+  };
+
+  // Purely linear to start: both presence flags read 0.
+  EXPECT_EQ(get_int(CUOPT_ATTR_HAS_QUADRATIC_OBJECTIVE), 0);
+  EXPECT_EQ(get_int(CUOPT_ATTR_HAS_QUADRATIC_CONSTRAINTS), 0);
+
+  // Add a quadratic objective term 2 * x0^2.
+  const cuopt_int_t q_row[1]   = {0};
+  const cuopt_int_t q_col[1]   = {0};
+  const cuopt_float_t q_val[1] = {2.0};
+  ASSERT_EQ(cuOptSetQuadraticObjective(problem, 1, q_row, q_col, q_val), CUOPT_SUCCESS);
+  EXPECT_EQ(get_int(CUOPT_ATTR_HAS_QUADRATIC_OBJECTIVE), 1);
+
+  // Add a quadratic constraint x1^2 + x0 <= 5.
+  const cuopt_int_t qc_row[1]         = {1};
+  const cuopt_int_t qc_col[1]         = {1};
+  const cuopt_float_t qc_val[1]       = {1.0};
+  const cuopt_int_t qc_lin_idx[1]     = {0};
+  const cuopt_float_t qc_lin_coeff[1] = {1.0};
+  ASSERT_EQ(
+    cuOptAddQuadraticConstraint(
+      problem, 1, qc_row, qc_col, qc_val, 1, qc_lin_idx, qc_lin_coeff, CUOPT_LESS_THAN, 5.0),
+    CUOPT_SUCCESS);
+  EXPECT_EQ(get_int(CUOPT_ATTR_HAS_QUADRATIC_CONSTRAINTS), 1);
+
+  cuOptDestroyProblem(&problem);
+}
+
+// Variable/row names are the only attributes no create/set routine can set, so read a tiny MPS with
+// known names and check them back.
+TEST(c_api, problem_attributes_names)
+{
+  const std::string mps_path =
+    std::filesystem::temp_directory_path().string() + "/cuopt_attr_names.mps";
+  {
+    std::ofstream out(mps_path);
+    out << "NAME          TOY\n"
+           "ROWS\n"
+           " N  COST\n"
+           " L  C1\n"
+           " G  C2\n"
+           "COLUMNS\n"
+           "    X1        COST      1.0        C1        1.0\n"
+           "    X1        C2        1.0\n"
+           "    X2        COST      2.0        C1        3.0\n"
+           "    X2        C2        1.0\n"
+           "RHS\n"
+           "    RHS       C1        10.0       C2        2.0\n"
+           "ENDATA\n";
+  }
+
+  cuOptOptimizationProblem problem = nullptr;
+  ASSERT_EQ(cuOptReadProblem(mps_path.c_str(), &problem), CUOPT_SUCCESS);
+
+  const char* var_names[2] = {nullptr, nullptr};
+  ASSERT_EQ(
+    cuOptGetProblemStringArrayAttribute(problem, CUOPT_STRING_ARRAY_VARIABLE_NAMES, var_names, 2),
+    CUOPT_SUCCESS);
+  EXPECT_STREQ(var_names[0], "X1");
+  EXPECT_STREQ(var_names[1], "X2");
+
+  const char* row_names[2] = {nullptr, nullptr};
+  ASSERT_EQ(
+    cuOptGetProblemStringArrayAttribute(problem, CUOPT_STRING_ARRAY_ROW_NAMES, row_names, 2),
+    CUOPT_SUCCESS);
+  EXPECT_STREQ(row_names[0], "C1");
+  EXPECT_STREQ(row_names[1], "C2");
+
+  cuOptDestroyProblem(&problem);
+  std::filesystem::remove(mps_path);
+}
+
 // Note: cuopt_cli subprocess tests are in Python (test_cpu_only_execution.py)
 // which provides better cross-platform subprocess handling
+
+// =============================================================================
+// Solution attributes
+//
+// Solver statistics are read through the scalar solution attribute accessors rather than
+// dedicated getters, so a new statistic is a new constant instead of a new exported symbol.
+// =============================================================================
+
+namespace {
+
+// Destroys the solution however the test leaves scope. The checks below use ASSERT, which
+// returns early on failure, so an explicit destroy at the end of the test would be skipped
+// exactly when a test fails and leak the solution into the rest of the binary.
+class scoped_solution_t {
+ public:
+  explicit scoped_solution_t(cuOptSolution solution) : solution_(solution) {}
+  ~scoped_solution_t()
+  {
+    if (solution_ != nullptr) { cuOptDestroySolution(&solution_); }
+  }
+  scoped_solution_t(const scoped_solution_t&)            = delete;
+  scoped_solution_t& operator=(const scoped_solution_t&) = delete;
+
+  cuOptSolution get() const { return solution_; }
+
+ private:
+  cuOptSolution solution_;
+};
+
+// Builds and solves a two-variable problem, integral when `mip` is set.
+cuOptSolution solve_tiny_problem(bool mip)
+{
+  cuopt_int_t row_offsets[]     = {0, 2};
+  cuopt_int_t column_indices[]  = {0, 1};
+  cuopt_float_t matrix_values[] = {1.0, 1.0};
+  cuopt_float_t objective[]     = {-1.0, -1.0};
+  cuopt_float_t rhs[]           = {3.5};
+  char constraint_sense[]       = {CUOPT_LESS_THAN};
+  cuopt_float_t lower_bounds[]  = {0.0, 0.0};
+  cuopt_float_t upper_bounds[]  = {10.0, 10.0};
+  char variable_types[]         = {mip ? CUOPT_INTEGER : CUOPT_CONTINUOUS,
+                           mip ? CUOPT_INTEGER : CUOPT_CONTINUOUS};
+
+  cuOptOptimizationProblem problem = nullptr;
+  cuOptSolverSettings settings     = nullptr;
+  cuOptSolution solution           = nullptr;
+  EXPECT_EQ(cuOptCreateProblem(1,
+                               2,
+                               CUOPT_MINIMIZE,
+                               0,
+                               objective,
+                               row_offsets,
+                               column_indices,
+                               matrix_values,
+                               constraint_sense,
+                               rhs,
+                               lower_bounds,
+                               upper_bounds,
+                               variable_types,
+                               &problem),
+            CUOPT_SUCCESS);
+  EXPECT_EQ(cuOptCreateSolverSettings(&settings), CUOPT_SUCCESS);
+  EXPECT_EQ(cuOptSolve(problem, settings, &solution), CUOPT_SUCCESS);
+  cuOptDestroyProblem(&problem);
+  cuOptDestroySolverSettings(&settings);
+  return solution;
+}
+
+}  // namespace
+
+TEST(c_api, lp_solution_attributes)
+{
+  cuOptSolution raw_solution = solve_tiny_problem(false);
+  ASSERT_NE(raw_solution, nullptr);
+  scoped_solution_t scoped(raw_solution);
+  cuOptSolution solution = scoped.get();
+
+  // Seed with NaN rather than a numeric sentinel: the solver cannot legitimately report NaN,
+  // so "still NaN" means the accessor never wrote the value. A numeric sentinel would be
+  // indistinguishable from a real result.
+  for (cuopt_int_t attribute : {CUOPT_SOLUTION_ATTR_LP_PRIMAL_RESIDUAL,
+                                CUOPT_SOLUTION_ATTR_LP_DUAL_RESIDUAL,
+                                CUOPT_SOLUTION_ATTR_LP_GAP}) {
+    cuopt_float_t value = std::nan("");
+    ASSERT_EQ(cuOptGetSolutionFloatAttribute(solution, attribute, &value), CUOPT_SUCCESS)
+      << "attribute " << attribute;
+    EXPECT_FALSE(std::isnan(value)) << "attribute " << attribute;
+  }
+  cuopt_float_t primal_residual = std::nan("");
+  ASSERT_EQ(cuOptGetSolutionFloatAttribute(
+              solution, CUOPT_SOLUTION_ATTR_LP_PRIMAL_RESIDUAL, &primal_residual),
+            CUOPT_SUCCESS);
+  EXPECT_GE(primal_residual, 0.0);
+
+  for (cuopt_int_t attribute :
+       {CUOPT_SOLUTION_ATTR_LP_NUM_ITERATIONS, CUOPT_SOLUTION_ATTR_LP_SOLVED_BY}) {
+    cuopt_int_t value = -1;
+    ASSERT_EQ(cuOptGetSolutionIntAttribute(solution, attribute, &value), CUOPT_SUCCESS)
+      << "attribute " << attribute;
+    EXPECT_GE(value, 0) << "attribute " << attribute;
+  }
+
+  // Asking for a float attribute through the int accessor, and the reverse, is rejected.
+  cuopt_int_t as_int     = 0;
+  cuopt_float_t as_float = 0;
+  EXPECT_EQ(cuOptGetSolutionIntAttribute(solution, CUOPT_SOLUTION_ATTR_LP_GAP, &as_int),
+            CUOPT_INVALID_ARGUMENT);
+  EXPECT_EQ(
+    cuOptGetSolutionFloatAttribute(solution, CUOPT_SOLUTION_ATTR_LP_NUM_ITERATIONS, &as_float),
+    CUOPT_INVALID_ARGUMENT);
+
+  // MIP selectors do not apply to an LP solution.
+  EXPECT_EQ(cuOptGetSolutionIntAttribute(solution, CUOPT_SOLUTION_ATTR_MIP_NUM_NODES, &as_int),
+            CUOPT_INVALID_ARGUMENT);
+
+  // Unknown selectors and null arguments are rejected.
+  EXPECT_EQ(cuOptGetSolutionIntAttribute(solution, 99999, &as_int), CUOPT_INVALID_ARGUMENT);
+  EXPECT_EQ(cuOptGetSolutionFloatAttribute(solution, CUOPT_SOLUTION_ATTR_LP_GAP, nullptr),
+            CUOPT_INVALID_ARGUMENT);
+  EXPECT_EQ(cuOptGetSolutionFloatAttribute(nullptr, CUOPT_SOLUTION_ATTR_LP_GAP, &as_float),
+            CUOPT_INVALID_ARGUMENT);
+}
+
+TEST(c_api, mip_solution_attributes)
+{
+  cuOptSolution raw_solution = solve_tiny_problem(true);
+  ASSERT_NE(raw_solution, nullptr);
+  scoped_solution_t scoped(raw_solution);
+  cuOptSolution solution = scoped.get();
+
+  // Violations are magnitudes, so they cannot be negative.
+  for (cuopt_int_t attribute : {CUOPT_SOLUTION_ATTR_MIP_PRESOLVE_TIME,
+                                CUOPT_SOLUTION_ATTR_MIP_MAX_CONSTRAINT_VIOLATION,
+                                CUOPT_SOLUTION_ATTR_MIP_MAX_INT_VIOLATION,
+                                CUOPT_SOLUTION_ATTR_MIP_MAX_VARIABLE_BOUND_VIOLATION}) {
+    cuopt_float_t value = std::nan("");
+    ASSERT_EQ(cuOptGetSolutionFloatAttribute(solution, attribute, &value), CUOPT_SUCCESS)
+      << "attribute " << attribute;
+    EXPECT_FALSE(std::isnan(value)) << "attribute " << attribute;
+    EXPECT_GE(value, 0.0) << "attribute " << attribute;
+  }
+
+  for (cuopt_int_t attribute :
+       {CUOPT_SOLUTION_ATTR_MIP_NUM_NODES, CUOPT_SOLUTION_ATTR_MIP_NUM_SIMPLEX_ITERATIONS}) {
+    cuopt_int_t value = -1;
+    ASSERT_EQ(cuOptGetSolutionIntAttribute(solution, attribute, &value), CUOPT_SUCCESS)
+      << "attribute " << attribute;
+    EXPECT_GE(value, 0) << "attribute " << attribute;
+  }
+
+  // LP selectors do not apply to a MIP solution.
+  cuopt_float_t as_float = 0;
+  EXPECT_EQ(cuOptGetSolutionFloatAttribute(solution, CUOPT_SOLUTION_ATTR_LP_GAP, &as_float),
+            CUOPT_INVALID_ARGUMENT);
+}
+
+// =============================================================================
+// Solution accessors on a solve that produced no values
+// =============================================================================
+
+TEST(c_api, solution_accessors_report_absent_values)
+{
+  // x >= 2 and x <= 1 has no feasible point, so the solve produces no primal, dual, or reduced
+  // cost values.
+  cuopt_int_t row_offsets[]     = {0, 1, 2};
+  cuopt_int_t column_indices[]  = {0, 0};
+  cuopt_float_t matrix_values[] = {1.0, 1.0};
+  cuopt_float_t objective[]     = {1.0};
+  cuopt_float_t rhs[]           = {2.0, 1.0};
+  char constraint_sense[]       = {CUOPT_GREATER_THAN, CUOPT_LESS_THAN};
+  cuopt_float_t lower_bounds[]  = {-CUOPT_INFINITY};
+  cuopt_float_t upper_bounds[]  = {CUOPT_INFINITY};
+  char variable_types[]         = {CUOPT_CONTINUOUS};
+
+  cuOptOptimizationProblem problem = nullptr;
+  cuOptSolverSettings settings     = nullptr;
+  cuOptSolution raw_solution       = nullptr;
+  ASSERT_EQ(cuOptCreateProblem(2,
+                               1,
+                               CUOPT_MINIMIZE,
+                               0,
+                               objective,
+                               row_offsets,
+                               column_indices,
+                               matrix_values,
+                               constraint_sense,
+                               rhs,
+                               lower_bounds,
+                               upper_bounds,
+                               variable_types,
+                               &problem),
+            CUOPT_SUCCESS);
+  ASSERT_EQ(cuOptCreateSolverSettings(&settings), CUOPT_SUCCESS);
+  ASSERT_EQ(cuOptSolve(problem, settings, &raw_solution), CUOPT_SUCCESS);
+  cuOptDestroyProblem(&problem);
+  cuOptDestroySolverSettings(&settings);
+
+  ASSERT_NE(raw_solution, nullptr);
+  scoped_solution_t scoped(raw_solution);
+  cuOptSolution solution = scoped.get();
+
+  cuopt_int_t termination_status = -1;
+  ASSERT_EQ(cuOptGetTerminationStatus(solution, &termination_status), CUOPT_SUCCESS);
+  ASSERT_EQ(termination_status, CUOPT_TERMINATION_STATUS_INFEASIBLE);
+
+  // The buffers carry a sentinel no solve would produce. Each accessor must report the absence
+  // rather than returning success having written nothing, which would leave the caller reading
+  // whatever the buffer already held and unable to tell that from a real result.
+  const cuopt_float_t sentinel = -12345.0;
+  cuopt_float_t primal[1]      = {sentinel};
+  cuopt_float_t dual[2]        = {sentinel, sentinel};
+  cuopt_float_t reduced[1]     = {sentinel};
+
+  EXPECT_EQ(cuOptGetPrimalSolution(solution, primal), CUOPT_INVALID_ARGUMENT);
+  EXPECT_EQ(cuOptGetDualSolution(solution, dual), CUOPT_INVALID_ARGUMENT);
+  EXPECT_EQ(cuOptGetReducedCosts(solution, reduced), CUOPT_INVALID_ARGUMENT);
+
+  EXPECT_EQ(primal[0], sentinel);
+  EXPECT_EQ(dual[0], sentinel);
+  EXPECT_EQ(dual[1], sentinel);
+  EXPECT_EQ(reduced[0], sentinel);
+}
+
+TEST(c_api, solution_accessors_on_a_problem_with_no_constraints)
+{
+  // A box-constrained LP with no constraints solves to optimality. Its primal and reduced-cost
+  // vectors are populated; its dual vector is empty because there are no constraints to have
+  // duals for, and asking for it reports CUOPT_INVALID_ARGUMENT.
+  cuopt_int_t row_offsets[]     = {0};
+  cuopt_int_t column_indices[]  = {0};
+  cuopt_float_t matrix_values[] = {0.0};
+  cuopt_float_t objective[]     = {1.0};
+  cuopt_float_t rhs[]           = {0.0};
+  char constraint_sense[]       = {CUOPT_LESS_THAN};
+  cuopt_float_t lower_bounds[]  = {0.0};
+  cuopt_float_t upper_bounds[]  = {5.0};
+  char variable_types[]         = {CUOPT_CONTINUOUS};
+
+  cuOptOptimizationProblem problem = nullptr;
+  cuOptSolverSettings settings     = nullptr;
+  cuOptSolution raw_solution       = nullptr;
+  ASSERT_EQ(cuOptCreateProblem(0,
+                               1,
+                               CUOPT_MINIMIZE,
+                               0,
+                               objective,
+                               row_offsets,
+                               column_indices,
+                               matrix_values,
+                               constraint_sense,
+                               rhs,
+                               lower_bounds,
+                               upper_bounds,
+                               variable_types,
+                               &problem),
+            CUOPT_SUCCESS);
+  ASSERT_EQ(cuOptCreateSolverSettings(&settings), CUOPT_SUCCESS);
+  ASSERT_EQ(cuOptSolve(problem, settings, &raw_solution), CUOPT_SUCCESS);
+  cuOptDestroyProblem(&problem);
+  cuOptDestroySolverSettings(&settings);
+
+  ASSERT_NE(raw_solution, nullptr);
+  scoped_solution_t scoped(raw_solution);
+  cuOptSolution solution = scoped.get();
+
+  cuopt_int_t termination_status = -1;
+  ASSERT_EQ(cuOptGetTerminationStatus(solution, &termination_status), CUOPT_SUCCESS);
+  ASSERT_EQ(termination_status, CUOPT_TERMINATION_STATUS_OPTIMAL);
+
+  const cuopt_float_t sentinel = -12345.0;
+  cuopt_float_t primal[1]      = {sentinel};
+  cuopt_float_t reduced[1]     = {sentinel};
+  cuopt_float_t dual[1]        = {sentinel};
+
+  // minimize x over 0 <= x <= 5, so the optimum sits at the lower bound with the objective
+  // coefficient as its reduced cost.
+  EXPECT_EQ(cuOptGetPrimalSolution(solution, primal), CUOPT_SUCCESS);
+  EXPECT_EQ(cuOptGetReducedCosts(solution, reduced), CUOPT_SUCCESS);
+  EXPECT_NEAR(primal[0], 0.0, 1e-6);
+  EXPECT_NEAR(reduced[0], 1.0, 1e-6);
+
+  cuopt_float_t objective_value = sentinel;
+  EXPECT_EQ(cuOptGetObjectiveValue(solution, &objective_value), CUOPT_SUCCESS);
+  EXPECT_NEAR(objective_value, 0.0, 1e-6);
+
+  // No constraints means no dual vector to return. Reporting that as an absence is intended,
+  // so this assertion is what pins it down.
+  EXPECT_EQ(cuOptGetDualSolution(solution, dual), CUOPT_INVALID_ARGUMENT);
+  EXPECT_EQ(dual[0], sentinel);
+}
+
+TEST(c_api, multi_gpu_pdlp_create_problem_row_sense)
+{
+  // min -x - y  s.t.  x + y <= 1,  0 <= x, y <= 10. Optimum is -1.
+  // cuOptCreateProblem stores a row sense and one RHS. Multi-GPU PDLP sizes the model from ranged
+  // constraint bounds, so those bounds have to be filled in before the solve. Presolve is off so
+  // it cannot fill them in first. num_gpus=-1 selects the multi-GPU path for every visible GPU,
+  // including a single one.
+  cuopt_int_t offsets[]  = {0, 2};
+  cuopt_int_t indices[]  = {0, 1};
+  cuopt_float_t values[] = {1.0, 1.0};
+  cuopt_float_t obj[]    = {-1.0, -1.0};
+  cuopt_float_t lb[]     = {0.0, 0.0};
+  cuopt_float_t ub[]     = {10.0, 10.0};
+  char vtypes[]          = {CUOPT_CONTINUOUS, CUOPT_CONTINUOUS};
+  char sense[]           = {CUOPT_LESS_THAN};
+  cuopt_float_t rhs[]    = {1.0};
+
+  struct handles_t {
+    cuOptOptimizationProblem problem{nullptr};
+    cuOptSolverSettings settings{nullptr};
+    cuOptSolution solution{nullptr};
+    ~handles_t()
+    {
+      cuOptDestroySolution(&solution);
+      cuOptDestroySolverSettings(&settings);
+      cuOptDestroyProblem(&problem);
+    }
+    handles_t()                            = default;
+    handles_t(const handles_t&)            = delete;
+    handles_t& operator=(const handles_t&) = delete;
+  } handles;
+
+  ASSERT_EQ(cuOptCreateProblem(1,
+                               2,
+                               CUOPT_MINIMIZE,
+                               0.0,
+                               obj,
+                               offsets,
+                               indices,
+                               values,
+                               sense,
+                               rhs,
+                               lb,
+                               ub,
+                               vtypes,
+                               &handles.problem),
+            CUOPT_SUCCESS);
+
+  cuopt_int_t num_constraints = -1;
+  ASSERT_EQ(cuOptGetNumConstraints(handles.problem, &num_constraints), CUOPT_SUCCESS);
+  ASSERT_EQ(num_constraints, 1);
+
+  ASSERT_EQ(cuOptCreateSolverSettings(&handles.settings), CUOPT_SUCCESS);
+  ASSERT_EQ(cuOptSetIntegerParameter(handles.settings, CUOPT_METHOD, CUOPT_METHOD_PDLP),
+            CUOPT_SUCCESS);
+  ASSERT_EQ(cuOptSetIntegerParameter(handles.settings, CUOPT_PRESOLVE, CUOPT_PRESOLVE_OFF),
+            CUOPT_SUCCESS);
+  // mPDLP path but with 1 GPU
+  ASSERT_EQ(cuOptSetIntegerParameter(handles.settings, CUOPT_NUM_GPUS, -1), CUOPT_SUCCESS);
+
+  const cuopt_int_t solve_status = cuOptSolve(handles.problem, handles.settings, &handles.solution);
+  char error_string[512]         = {};
+  if (handles.solution != nullptr) {
+    cuOptGetErrorString(handles.solution, error_string, sizeof(error_string));
+  }
+  ASSERT_EQ(solve_status, CUOPT_SUCCESS) << error_string;
+
+  cuopt_int_t termination_status = -1;
+  ASSERT_EQ(cuOptGetTerminationStatus(handles.solution, &termination_status), CUOPT_SUCCESS);
+  ASSERT_EQ(termination_status, CUOPT_TERMINATION_STATUS_OPTIMAL) << error_string;
+
+  cuopt_float_t objective = 0.0;
+  ASSERT_EQ(cuOptGetObjectiveValue(handles.solution, &objective), CUOPT_SUCCESS);
+  EXPECT_NEAR(objective, -1.0, 1e-3);
+}
+
+#ifdef CUOPT_ENABLE_CUPSLP
+namespace {
+
+class CupslpPostsolveTest : public ::testing::TestWithParam<cuopt_int_t> {
+ protected:
+  void SetUp() override
+  {
+    ASSERT_EQ(cuOptCreateSolverSettings(&settings_), CUOPT_SUCCESS);
+    ASSERT_EQ(cuOptSetIntegerParameter(settings_, CUOPT_PRESOLVE, CUOPT_PRESOLVE_CUPSLP),
+              CUOPT_SUCCESS);
+    cuopt_int_t presolve = -1;
+    ASSERT_EQ(cuOptGetIntegerParameter(settings_, CUOPT_PRESOLVE, &presolve), CUOPT_SUCCESS);
+    EXPECT_EQ(presolve, 3);
+    ASSERT_EQ(cuOptSetIntegerParameter(settings_, CUOPT_METHOD, CUOPT_METHOD_PDLP), CUOPT_SUCCESS);
+    ASSERT_EQ(cuOptSetFloatParameter(settings_, CUOPT_TIME_LIMIT, 30.0), CUOPT_SUCCESS);
+    for (const char* parameter : {CUOPT_ABSOLUTE_PRIMAL_TOLERANCE,
+                                  CUOPT_RELATIVE_PRIMAL_TOLERANCE,
+                                  CUOPT_ABSOLUTE_DUAL_TOLERANCE,
+                                  CUOPT_RELATIVE_DUAL_TOLERANCE,
+                                  CUOPT_ABSOLUTE_GAP_TOLERANCE,
+                                  CUOPT_RELATIVE_GAP_TOLERANCE}) {
+      ASSERT_EQ(cuOptSetFloatParameter(settings_, parameter, 1e-8), CUOPT_SUCCESS);
+    }
+  }
+
+  void TearDown() override
+  {
+    cuOptDestroySolution(&solution_);
+    cuOptDestroySolverSettings(&settings_);
+    cuOptDestroyProblem(&problem_);
+  }
+
+  void solve()
+  {
+    const cuopt_int_t status = cuOptSolve(problem_, settings_, &solution_);
+    char error[512]          = {};
+    if (solution_ != nullptr) { cuOptGetErrorString(solution_, error, sizeof(error)); }
+    ASSERT_EQ(status, CUOPT_SUCCESS) << error;
+    ASSERT_NE(solution_, nullptr);
+    cuopt_int_t termination_status = -1;
+    ASSERT_EQ(cuOptGetTerminationStatus(solution_, &termination_status), CUOPT_SUCCESS);
+    ASSERT_EQ(termination_status, CUOPT_TERMINATION_STATUS_OPTIMAL) << error;
+  }
+
+  void check_objectives(cuopt_float_t expected)
+  {
+    cuopt_float_t primal_objective = std::nan("");
+    cuopt_float_t dual_objective   = std::nan("");
+    ASSERT_EQ(cuOptGetObjectiveValue(solution_, &primal_objective), CUOPT_SUCCESS);
+    ASSERT_EQ(cuOptGetDualObjectiveValue(solution_, &dual_objective), CUOPT_SUCCESS);
+    EXPECT_NEAR(primal_objective, expected, tolerance);
+    EXPECT_NEAR(dual_objective, expected, tolerance);
+  }
+
+  cuopt_float_t objective_sign() const { return GetParam() == CUOPT_MINIMIZE ? 1.0 : -1.0; }
+
+  static constexpr cuopt_float_t tolerance = 1e-5;
+  cuOptOptimizationProblem problem_{nullptr};
+  cuOptSolverSettings settings_{nullptr};
+  cuOptSolution solution_{nullptr};
+};
+
+TEST_P(CupslpPostsolveTest, PartiallyReduced)
+{
+  // Removing fixed z leaves the coupled LP min x + y + w with all pair sums >= 1.
+  // The unique optimum is x = y = w = 1/2, z = 2. A nonzero offset and cost for z
+  // exercise objective reconstruction; negating the objective exercises maximize dual signs.
+  const cuopt_float_t sign     = objective_sign();
+  cuopt_int_t offsets[]        = {0, 3, 5, 7};
+  cuopt_int_t indices[]        = {0, 1, 3, 1, 2, 0, 2};
+  cuopt_float_t values[]       = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+  cuopt_float_t objective[]    = {sign, sign, sign, 7.0 * sign};
+  cuopt_float_t rhs[]          = {3.0, 1.0, 1.0};
+  char senses[]                = {CUOPT_GREATER_THAN, CUOPT_GREATER_THAN, CUOPT_GREATER_THAN};
+  cuopt_float_t lower_bounds[] = {0.0, 0.0, 0.0, 2.0};
+  cuopt_float_t upper_bounds[] = {10.0, 10.0, 10.0, 2.0};
+  char variable_types[] = {CUOPT_CONTINUOUS, CUOPT_CONTINUOUS, CUOPT_CONTINUOUS, CUOPT_CONTINUOUS};
+  ASSERT_EQ(cuOptCreateProblem(3,
+                               4,
+                               GetParam(),
+                               5.0 * sign,
+                               objective,
+                               offsets,
+                               indices,
+                               values,
+                               senses,
+                               rhs,
+                               lower_bounds,
+                               upper_bounds,
+                               variable_types,
+                               &problem_),
+            CUOPT_SUCCESS);
+
+  // Reusing the original problem checks that presolve does not replace it with the reduced
+  // model or retain stale postsolve state after a solution is destroyed.
+  for (int repetition = 0; repetition < 3; ++repetition) {
+    SCOPED_TRACE(repetition);
+    ASSERT_NO_FATAL_FAILURE(solve());
+    ASSERT_NO_FATAL_FAILURE(check_objectives(20.5 * sign));
+    cuopt_float_t primal[4]  = {std::nan(""), std::nan(""), std::nan(""), std::nan("")};
+    cuopt_float_t dual[3]    = {std::nan(""), std::nan(""), std::nan("")};
+    cuopt_float_t reduced[4] = {std::nan(""), std::nan(""), std::nan(""), std::nan("")};
+    ASSERT_EQ(cuOptGetPrimalSolution(solution_, primal), CUOPT_SUCCESS);
+    ASSERT_EQ(cuOptGetDualSolution(solution_, dual), CUOPT_SUCCESS);
+    ASSERT_EQ(cuOptGetReducedCosts(solution_, reduced), CUOPT_SUCCESS);
+    for (int column = 0; column < 3; ++column) {
+      EXPECT_NEAR(primal[column], 0.5, tolerance);
+      EXPECT_NEAR(reduced[column], 0.0, tolerance);
+    }
+    EXPECT_NEAR(primal[3], 2.0, tolerance);
+    for (int row = 0; row < 3; ++row) {
+      EXPECT_NEAR(dual[row], 0.5 * sign, tolerance);
+      cuopt_float_t activity = 0.0;
+      for (int entry = offsets[row]; entry < offsets[row + 1]; ++entry) {
+        activity += values[entry] * primal[indices[entry]];
+      }
+      EXPECT_NEAR(activity, rhs[row], tolerance);
+    }
+    // Stationarity uses the original matrix, including the eliminated column.
+    EXPECT_NEAR(objective[0] - dual[0] - dual[2], reduced[0], tolerance);
+    EXPECT_NEAR(objective[1] - dual[0] - dual[1], reduced[1], tolerance);
+    EXPECT_NEAR(objective[2] - dual[1] - dual[2], reduced[2], tolerance);
+    EXPECT_NEAR(objective[3] - dual[0], reduced[3], tolerance);
+    cuopt_int_t iterations = -1;
+    ASSERT_EQ(
+      cuOptGetSolutionIntAttribute(solution_, CUOPT_SOLUTION_ATTR_LP_NUM_ITERATIONS, &iterations),
+      CUOPT_SUCCESS);
+    EXPECT_GT(iterations, 0);
+    cuOptDestroySolution(&solution_);
+    EXPECT_EQ(solution_, nullptr);
+  }
+}
+
+TEST_P(CupslpPostsolveTest, FullyEliminated)
+{
+  // Both variables and rows disappear. Postsolve must still return original-sized primal,
+  // dual, and reduced-cost vectors even though the reduced solver has no solution vectors.
+  const cuopt_float_t sign  = objective_sign();
+  cuopt_int_t offsets[]     = {0, 2, 4};
+  cuopt_int_t indices[]     = {0, 1, 0, 1};
+  cuopt_float_t values[]    = {1.0, 1.0, 2.0, -1.0};
+  cuopt_float_t objective[] = {2.0 * sign, -sign};
+  cuopt_float_t rhs[]       = {5.0, -2.0};
+  char senses[]             = {CUOPT_EQUAL, CUOPT_GREATER_THAN};
+  cuopt_float_t bounds[]    = {2.0, 3.0};
+  char variable_types[]     = {CUOPT_CONTINUOUS, CUOPT_CONTINUOUS};
+  ASSERT_EQ(cuOptCreateProblem(2,
+                               2,
+                               GetParam(),
+                               14.0 * sign,
+                               objective,
+                               offsets,
+                               indices,
+                               values,
+                               senses,
+                               rhs,
+                               bounds,
+                               bounds,
+                               variable_types,
+                               &problem_),
+            CUOPT_SUCCESS);
+
+  for (int repetition = 0; repetition < 3; ++repetition) {
+    SCOPED_TRACE(repetition);
+    ASSERT_NO_FATAL_FAILURE(solve());
+    ASSERT_NO_FATAL_FAILURE(check_objectives(15.0 * sign));
+    cuopt_float_t primal[2]  = {std::nan(""), std::nan("")};
+    cuopt_float_t dual[2]    = {std::nan(""), std::nan("")};
+    cuopt_float_t reduced[2] = {std::nan(""), std::nan("")};
+    ASSERT_EQ(cuOptGetPrimalSolution(solution_, primal), CUOPT_SUCCESS);
+    ASSERT_EQ(cuOptGetDualSolution(solution_, dual), CUOPT_SUCCESS);
+    ASSERT_EQ(cuOptGetReducedCosts(solution_, reduced), CUOPT_SUCCESS);
+    EXPECT_NEAR(primal[0], 2.0, tolerance);
+    EXPECT_NEAR(primal[1], 3.0, tolerance);
+    EXPECT_NEAR(primal[0] + primal[1], rhs[0], tolerance);
+    EXPECT_GE(2.0 * primal[0] - primal[1], rhs[1] - tolerance);
+    EXPECT_NEAR(dual[1], 0.0, tolerance);  // The second constraint is strictly slack.
+    EXPECT_NEAR(objective[0] - dual[0] - 2.0 * dual[1], reduced[0], tolerance);
+    EXPECT_NEAR(objective[1] - dual[0] + dual[1], reduced[1], tolerance);
+    cuopt_int_t iterations = -1;
+    ASSERT_EQ(
+      cuOptGetSolutionIntAttribute(solution_, CUOPT_SOLUTION_ATTR_LP_NUM_ITERATIONS, &iterations),
+      CUOPT_SUCCESS);
+    EXPECT_EQ(iterations, 0);
+    cuOptDestroySolution(&solution_);
+    EXPECT_EQ(solution_, nullptr);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(cuPSLP,
+                         CupslpPostsolveTest,
+                         ::testing::Values(CUOPT_MINIMIZE, CUOPT_MAXIMIZE));
+
+}  // namespace
+#endif

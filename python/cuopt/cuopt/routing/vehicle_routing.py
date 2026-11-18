@@ -5,8 +5,8 @@ import numpy as np
 
 import cudf
 
-from cuopt import routing
 from cuopt.routing import vehicle_routing_wrapper
+from cuopt.routing._deferred import _DeferredDataModel
 from cuopt.utilities import catch_cuopt_exception
 
 from .validation import (
@@ -19,7 +19,7 @@ from .validation import (
 )
 
 
-class DataModel(vehicle_routing_wrapper.DataModel):
+class DataModel(_DeferredDataModel):
     """
 
     DataModel(n_locations, n_fleet, n_orders: int = -1)
@@ -49,6 +49,12 @@ class DataModel(vehicle_routing_wrapper.DataModel):
         ``pandas.Series``/``pandas.DataFrame``. cuDF inputs stay on the GPU;
         host (numpy/pandas) inputs are copied to the device for the local
         solve. Python lists and tuples are not supported.
+
+      - Inputs are recorded and the device model is built on demand (deferred
+        to ``Solve``), so solver-side (C++) validation and dtype-cast warnings
+        surface when the model is built rather than at the individual setter
+        call. Structural checks (matrix shape, array sizes, value ranges) are
+        still validated eagerly at the setter.
 
     Examples
     --------
@@ -134,7 +140,8 @@ class DataModel(vehicle_routing_wrapper.DataModel):
         >>> data_model.add_cost_matrix(cost_mat_car, 2)
         """
 
-        if vehicle_type in self.costs:
+        # a[1] is vehicle_type: the recorded call is (cost_mat, vehicle_type).
+        if vehicle_type in {a[1] for a in self._recorded("add_cost_matrix")}:
             raise ValueError("Vehicle type matrix has already been added")
 
         if not skip_validation:
@@ -216,7 +223,10 @@ class DataModel(vehicle_routing_wrapper.DataModel):
         >>> time_mat = cudf.DataFrame(time_mat)
         >>> data_model.add_transit_time_matrix(time_mat, 0)
         """
-        if vehicle_type in self.transit_times:
+        # a[1] is vehicle_type (see add_cost_matrix).
+        if vehicle_type in {
+            a[1] for a in self._recorded("add_transit_time_matrix")
+        }:
             raise ValueError("Vehicle type matrix has already been added")
 
         validate_matrix(mat, "transit time matrix", self.get_num_locations())
@@ -267,7 +277,7 @@ class DataModel(vehicle_routing_wrapper.DataModel):
         >>> data_model.set_break_locations(cudf.Series([1, 3]))
         """
         validate_range(
-            break_locations, "break_locations", 0, self.get_num_locations()
+            break_locations, "break_locations", 0, self.get_num_locations() - 1
         )
         super().set_break_locations(break_locations)
 
@@ -395,10 +405,10 @@ class DataModel(vehicle_routing_wrapper.DataModel):
         """
         if locations is None:
             locations = cudf.Series()
-        validate_range(vehicle_id, "vehicle id", 0, self.get_fleet_size())
+        validate_range(vehicle_id, "vehicle id", 0, self.get_fleet_size() - 1)
         if len(locations) > 0:
             validate_range(
-                locations, "break locations", 0, self.get_num_locations()
+                locations, "break locations", 0, self.get_num_locations() - 1
             )
 
         super().add_vehicle_break(
@@ -406,12 +416,78 @@ class DataModel(vehicle_routing_wrapper.DataModel):
         )
 
     @catch_cuopt_exception
+    def add_vehicle_distance_break(
+        self, vehicle_id, distance_min, distance_max, duration, locations=None
+    ):
+        """
+        Specify a distance-based break for a given vehicle. Use this api the
+        same way as :meth:`add_vehicle_break`: call it once per break, and
+        call it again for additional breaks on the same vehicle.
+
+        The solver inserts one mandatory stop no later than the hard
+        cumulative-distance limit ``distance_max``. ``distance_min`` is the
+        soft target for that stop. Arriving before ``distance_min``
+        contributes to ``Objective.DISTANCE_BREAK_COST``. Its default weight
+        is ``1.0``; use :meth:`set_objective_function` to tune it or
+        explicitly set it to ``0.0`` to disable the early-break penalty.
+
+        ``distance_min`` and ``distance_max`` are expressed in the same units
+        as the primary cost matrix.
+
+        Note: This function cannot be used in conjunction with
+        add_break_dimension
+
+        Parameters
+        ----------
+        vehicle_id: integer
+            Vehicle Id for which the break is being specified
+        distance_min:  float
+            Soft lower bound on cumulative distance at the break
+        distance_max:    float
+            Latest cumulative distance by which the vehicle must take the
+            break. Must be strictly greater than ``distance_min``.
+        duration:  integer
+            Time spent at the break location
+        locations: cudf.Series dtype - int32
+            List of locations where this break can be taken. By default
+            any location can be used
+
+        Examples
+        --------
+        >>> from cuopt import routing
+        >>> vehicle_num = 2
+        >>> d = routing.DataModel(nodes, vehicle_num)
+        >>> d.add_vehicle_distance_break(0, 120, 150, 10, cudf.Series([3, 6]))
+        >>> d.add_vehicle_distance_break(0, 270, 300, 10, cudf.Series([3, 6]))
+        >>> d.add_vehicle_distance_break(1, 0, 200, 10)
+        """
+        if locations is None:
+            locations = cudf.Series()
+        validate_range(vehicle_id, "vehicle id", 0, self.get_fleet_size() - 1)
+        validate_non_negative(distance_min, "distance min")
+        validate_positive(distance_max, "distance max")
+        validate_non_negative(duration, "duration")
+        if distance_min >= distance_max:
+            raise ValueError("distance_min must be smaller than distance_max")
+        if len(locations) > 0:
+            validate_range(
+                locations, "break locations", 0, self.get_num_locations() - 1
+            )
+
+        super().add_vehicle_distance_break(
+            vehicle_id, distance_min, distance_max, duration, locations
+        )
+
+    @catch_cuopt_exception
     def set_objective_function(self, objectives, objective_weights):
         """
         The objective function can be defined as a linear combination of
         the different objectives. Solver optimizes for vehicle
-        count first and then the total objective. The default value of
-        1 is used for COST objective weight and 0 for other objective weights
+        count first and then the total objective. ``COST`` defaults to weight
+        ``1.0``. ``PRIZE``, ``VEHICLE_FIXED_COST``, and
+        ``DISTANCE_BREAK_COST`` also default to ``1.0`` when their associated
+        model data is configured; explicitly pass ``0.0`` to disable them.
+        Other objective weights default to ``0.0``.
 
         Parameters
         ----------
@@ -481,7 +557,7 @@ class DataModel(vehicle_routing_wrapper.DataModel):
             "number of orders",
         )
         validate_range(
-            order_locations, "order locations", 0, self.get_num_locations()
+            order_locations, "order locations", 0, self.get_num_locations() - 1
         )
         super().set_order_locations(order_locations)
 
@@ -893,7 +969,7 @@ class DataModel(vehicle_routing_wrapper.DataModel):
         >>> d.add_vehicle_order_match(2, cudf.Series([3]))
         >>> cuopt_solution = routing.Solve(d)
         """
-        validate_range(orders, "orders served", 0, self.get_num_orders())
+        validate_range(orders, "orders served", 0, self.get_num_orders() - 1)
         validate_range(
             len(orders), "number of orders served", 0, self.get_num_orders()
         )
@@ -938,13 +1014,13 @@ class DataModel(vehicle_routing_wrapper.DataModel):
         >>> cuopt_solution = routing.Solve(d)
         """
         validate_range(
-            len(vehicles), "Number of vehicles", 0, self.get_fleet_size() + 1
+            len(vehicles), "Number of vehicles", 0, self.get_fleet_size()
         )
         validate_range(
             vehicles,
             "vehicles that can fulfill the order",
             0,
-            self.get_fleet_size(),
+            self.get_fleet_size() - 1,
         )
         super().add_order_vehicle_match(order_id, vehicles)
 
@@ -1501,6 +1577,16 @@ class SolverSettings(vehicle_routing_wrapper.SolverSettings):
         return super().get_time_limit()
 
     @catch_cuopt_exception
+    def get_verbose_mode(self):
+        """Return whether verbose solver output is enabled."""
+        return super().get_verbose_mode()
+
+    @catch_cuopt_exception
+    def get_error_logging_mode(self):
+        """Return whether constraint error logging is enabled."""
+        return super().get_error_logging_mode()
+
+    @catch_cuopt_exception
     def get_best_results_file_path(self):
         """
         Returns file path where result will be stored,
@@ -1546,9 +1632,15 @@ def Solve(data_model, solver_settings=None):
     if solver_settings is None:
         solver_settings = SolverSettings()
 
-    solution = vehicle_routing_wrapper.Solve(data_model, solver_settings)
+    solution = vehicle_routing_wrapper.Solve(
+        data_model._build(), solver_settings
+    )
     if solver_settings.get_config_file_name() is not None:
-        routing.utils.save_data_model_to_yaml(
+        # imported here rather than at module scope: utils lives outside the
+        # cuopt.routing import path so that importing routing stays GPU-free.
+        from cuopt.routing import utils
+
+        utils.save_data_model_to_yaml(
             data_model,
             solver_settings,
             solution,
@@ -1603,4 +1695,5 @@ def BatchSolve(data_model_list, solver_settings=None):
     if solver_settings is None:
         solver_settings = SolverSettings()
 
-    return vehicle_routing_wrapper.BatchSolve(data_model_list, solver_settings)
+    built_list = [dm._build() for dm in data_model_list]
+    return vehicle_routing_wrapper.BatchSolve(built_list, solver_settings)

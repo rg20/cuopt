@@ -7,13 +7,17 @@
 
 #pragma once
 
+#include <cuopt/export.hpp>
+
 #include <cstdint>
 #include <span>
 #include <string>
 #include <type_traits>
 #include <vector>
 
-namespace cuopt::mathematical_optimization::io {
+namespace cuopt {
+namespace CUOPT_EXPORT mathematical_optimization {
+namespace io {
 
 /**
  * @brief A representation of a linear programming (LP) optimization problem
@@ -247,8 +251,7 @@ class mps_data_model_t {
     /** ROWS declaration index (among all constraint rows), not an index into the linear CSR. */
     i_t constraint_row_index{};
     std::string constraint_row_name{};
-    /** MPS ROWS sense for this quadratic row; only 'L' (≤) is supported for convex QCQP at the
-     * moment. */
+    /** MPS ROWS sense for this quadratic row: 'L' (≤) or 'G' (≥). 'E' is not supported. */
     char constraint_row_type{};
     std::vector<f_t> linear_values{};
     std::vector<i_t> linear_indices{};
@@ -329,7 +332,7 @@ class mps_data_model_t {
   bool has_quadratic_constraints() const noexcept;
 
   /** whether to maximize or minimize the objective function */
-  bool maximize_;
+  bool maximize_{false};
   /**
    * the constraint matrix itself in the CSR format
    * @{
@@ -401,4 +404,6 @@ template <typename i_t, typename f_t>
 void canonicalize_quadratic_constraints(
   std::vector<typename mps_data_model_t<i_t, f_t>::quadratic_constraint_t>& constraints);
 
-}  // namespace cuopt::mathematical_optimization::io
+}  // namespace io
+}  // namespace CUOPT_EXPORT mathematical_optimization
+}  // namespace cuopt

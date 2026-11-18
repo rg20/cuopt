@@ -16,7 +16,7 @@ previous one.
 
 Note:
     Warmstart data is only available for Linear Programming (LP) problems,
-    not for Mixed Integer Linear Programming (MILP) problems.
+    not for Mixed Integer Programming (MIP) problems.
 
 Problem 1:
     Maximize: 2*x + y
@@ -43,6 +43,7 @@ from cuopt.linear_programming.problem import Problem, CONTINUOUS, MAXIMIZE
 from cuopt.linear_programming.solver.solver_parameters import (
     CUOPT_METHOD,
     CUOPT_PDLP_SOLVER_MODE,
+    CUOPT_PRESOLVE,
 )
 from cuopt.linear_programming.solver_settings import (
     SolverSettings,
@@ -73,6 +74,9 @@ def main():
     settings = SolverSettings()
     settings.set_parameter(CUOPT_METHOD, SolverMethod.PDLP)
     settings.set_parameter(CUOPT_PDLP_SOLVER_MODE, PDLPSolverMode.Stable2)
+    # This example is about warm starting PDLP. Presolve reduces this small LP to
+    # an empty problem, so PDLP would never run and produce warmstart data.
+    settings.set_parameter(CUOPT_PRESOLVE, 0)
 
     # Solve the problem
     problem.solve(settings)
