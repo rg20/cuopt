@@ -1073,11 +1073,13 @@ endif ()
 add_library(cuopt_mathopt SHARED $<TARGET_OBJECTS:cuopt_mathopt_objs>)
 cuopt_configure_component(cuopt_mathopt)
 if(CUOPT_ENABLE_CUPSLP)
-    set(CUPSLP_DIST_DIR "$ENV{HOME}/git-repos/cuPSLP-distribution" CACHE PATH
+    set(CUPSLP_DIST_DIR "$ENV{CUPSLP_DIST_DIR}" CACHE PATH
         "Path to the cuPSLP distribution containing include/cupslp.h and libcupslp.so.0")
     if(NOT EXISTS "${CUPSLP_DIST_DIR}/include/cupslp.h" OR
        NOT EXISTS "${CUPSLP_DIST_DIR}/libcupslp.so.0")
-        message(FATAL_ERROR "CUOPT_ENABLE_CUPSLP requires a valid CUPSLP_DIST_DIR")
+        message(FATAL_ERROR
+            "CUOPT_ENABLE_CUPSLP requires include/cupslp.h and libcupslp.so.0. "
+            "Set the CUPSLP_DIST_DIR environment variable or pass -DCUPSLP_DIST_DIR=<path>.")
     endif()
     target_include_directories(cuopt_mathopt_objs SYSTEM PRIVATE "${CUPSLP_DIST_DIR}/include")
     target_compile_definitions(cuopt_mathopt_objs PRIVATE CUOPT_ENABLE_CUPSLP)
