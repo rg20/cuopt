@@ -430,6 +430,56 @@ __device__ i_t find_request_insertion(typename solution_t<i_t, f_t, REQUEST>::vi
   return size_of_compacted_requests;
 }
 
+// Exhaustively evaluate optional replacements when ejecting one PDP request
+// leaves an ordinary empty route. Empty-route candidates have no geometric
+// neighbor ordering; limiting this list would favor low request indices.
+template <typename i_t, typename f_t, request_t REQUEST>
+__device__ void find_empty_prize_exchange_insertions(
+  typename solution_t<i_t, f_t, REQUEST>::view_t& solution,
+  typename move_candidates_t<i_t, f_t>::view_t& move_candidates,
+  i_t ejected_pickup_id,
+  const typename route_t<i_t, f_t, REQUEST>::view_t& route,
+  raft::device_span<uint16_t>& compacted_requests,
+  raft::device_span<uint16_t>& sh_buf_temp,
+  double excess_curr_route)
+{
+  static_assert(REQUEST == request_t::PDP);
+  cuopt_assert(route.get_num_nodes() == 1 && route.get_num_service_nodes() == 0,
+               "Expected an empty route after singleton ejection");
+  const i_t n_candidates =
+    filter_viable_requests<i_t, f_t, REQUEST, search_type_t::IMPROVE, true, true>(
+      solution, move_candidates, route, 0, ejected_pickup_id, compacted_requests, sh_buf_temp);
+
+  // The original route map still marks the ejected pair as served. The filter
+  // therefore supplies only other, globally unserved pickup IDs.
+  const double excess_limit = get_excess_limit<i_t, f_t, REQUEST, search_type_t::IMPROVE>(
+    solution, move_candidates, route.get_id(), excess_curr_route, -1);
+  for (i_t candidate_idx = threadIdx.x; candidate_idx < n_candidates; candidate_idx += blockDim.x) {
+    const i_t node_id = compacted_requests[candidate_idx];
+    cuopt_assert(!solution.route_node_map.is_node_served(node_id),
+                 "Replacement request must be unserved");
+    const auto request_id =
+      request_id_t<REQUEST>(node_id, solution.problem.order_info.pair_indices[node_id]);
+    auto request_node    = create_request_node<i_t, f_t, REQUEST>(solution.problem, request_id);
+    const auto prev_node = route.get_node(0);
+    prev_node.calculate_forward_all(request_node.node(), route.vehicle_info());
+
+    cand_t candidate = cand_t::create<search_type_t::IMPROVE>();
+    find_brother_insertion<i_t, f_t, REQUEST, pick_mode_t::COST_DELTA, true>(
+      solution,
+      request_node,
+      0,
+      route,
+      move_candidates.include_objective,
+      move_candidates.weights,
+      excess_limit,
+      &candidate);
+    if (candidate.is_valid(search_type_t::IMPROVE)) {
+      move_candidates.record_candidate_thread_safe(candidate, node_id, ejected_pickup_id);
+    }
+  }
+}
+
 template <typename i_t,
           typename f_t,
           request_t REQUEST,
@@ -726,6 +776,25 @@ __global__ void find_insertions_kernel(typename solution_t<i_t, f_t, REQUEST>::v
 
   const double excess_curr_route =
     solution.routes[route_idx].get_weighted_excess(move_candidates.weights);
+
+  // One block scans all unserved replacements for an ejected singleton.
+  // Preserve the ordinary bounded search for nonempty routes and routes with
+  // remaining break/special nodes, and for every other search mode.
+  if constexpr (REQUEST == request_t::PDP && search_type == search_type_t::IMPROVE &&
+                insert_unserviced) {
+    if (is_ejected && route.get_num_nodes() == 1 && route.get_num_service_nodes() == 0) {
+      if (blockIdx.x % move_candidates.number_of_blocks_per_ls_route == 0) {
+        find_empty_prize_exchange_insertions<i_t, f_t, REQUEST>(solution,
+                                                                move_candidates,
+                                                                ejected_id.id(),
+                                                                route,
+                                                                compacted_requests,
+                                                                sh_buf_temp,
+                                                                excess_curr_route);
+      }
+      return;
+    }
+  }
 
   // for CROSS moves, we will do only 4 checks in total:
   //  1) insert pickup node in place of pickup ejection and find best delivery insertion
