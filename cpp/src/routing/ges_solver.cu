@@ -6,6 +6,11 @@
 /* clang-format on */
 
 #include "ges_solver.cuh"
+
+#include <algorithm>
+#include <cmath>
+#include <utility>
+#include <vector>
 #include "routing_helpers.cuh"
 
 #include "diversity/diverse_solver.hpp"
@@ -18,6 +23,72 @@
 
 namespace cuopt {
 namespace routing {
+
+namespace {
+
+// Polish only the selected output copy. Search populations never receive an
+// empty parent or lose a route that may be useful for subsequent exploration.
+template <typename i_t, typename f_t, request_t REQUEST>
+bool polish_economic_prize_routes(detail::solution_t<i_t, f_t, REQUEST>& sol)
+{
+  const auto& problem = *sol.problem_ptr;
+  if (!problem.has_prize_collection()) { return false; }
+  sol.compute_cost();
+  if (!sol.is_feasible()) { return false; }
+
+  // Assignment export already performs this normalization. Count used vehicles,
+  // not empty allocated slots, when enforcing the explicit model minimum.
+  sol.remove_empty_routes();
+  sol.compute_cost();
+  const i_t min_vehicles  = problem.data_view_ptr->get_min_vehicles();
+  const i_t used_vehicles = sol.get_n_routes();
+  if (used_vehicles <= min_vehicles) { return false; }
+
+  const auto objective_weights = problem.dimensions_info.objective_weights;
+  const double before = detail::objective_cost_t::dot(objective_weights, sol.get_objective_cost());
+  if (!std::isfinite(before)) { return false; }
+
+  // The implemented solution objective is the sum of route objective vectors.
+  // A whole-route deletion preserves every retained route and its constraints.
+  // Read freshly recomputed components; do not approximate travel, prize, fixed
+  // costs, or any other enabled objective dimension.
+  std::vector<std::pair<double, i_t>> removable;
+  for (i_t route_id = 0; route_id < used_vehicles; ++route_id) {
+    const auto& route          = sol.get_route(route_id);
+    const auto route_objective = route.objective_cost.value(sol.sol_handle->get_stream());
+    const double contribution  = detail::objective_cost_t::dot(objective_weights, route_objective);
+    if (!std::isfinite(contribution)) { return false; }
+    if (contribution > detail::EPSILON) { removable.emplace_back(contribution, route_id); }
+  }
+  if (removable.empty()) { return false; }
+  std::sort(removable.begin(), removable.end(), [](const auto& a, const auto& b) {
+    return a.first > b.first || (a.first == b.first && a.second < b.second);
+  });
+  const size_t removal_budget = static_cast<size_t>(used_vehicles - min_vehicles);
+  if (removable.size() > removal_budget) { removable.resize(removal_budget); }
+  std::vector<i_t> route_ids;
+  route_ids.reserve(removable.size());
+  for (const auto& candidate : removable) {
+    route_ids.push_back(candidate.second);
+  }
+  std::sort(route_ids.begin(), route_ids.end());
+
+  // Retain a complete rollback copy until the full post-removal objective and
+  // feasibility are verified. min_vehicles is not part of sol.is_feasible().
+  auto original = sol;
+  sol.remove_routes(route_ids);
+  sol.compute_cost();
+  const double after = detail::objective_cost_t::dot(objective_weights, sol.get_objective_cost());
+  if (sol.get_n_routes() < min_vehicles || !sol.is_feasible() || !std::isfinite(after) ||
+      !(after + detail::EPSILON < before)) {
+    sol.copy_device_solution(original);
+    return false;
+  }
+  sol.global_runtime_checks(false, true, "economic_prize_route_polish");
+  return true;
+}
+
+}  // namespace
 
 template <typename i_t, typename f_t, request_t REQUEST>
 ges_solver_t<i_t, f_t, REQUEST>::ges_solver_t(const data_model_view_t<i_t, f_t>& data_model,
@@ -66,7 +137,12 @@ assignment_t<i_t> ges_solver_t<i_t, f_t, REQUEST>::compute_ges_solution(
 
   solver.perform_search(expected_route_count, feasible_only);
   if (solver.reserve_population.is_feasible()) {
-    auto best_sol = solver.reserve_population.best_feasible().sol;
+    auto best_adapted = solver.reserve_population.best_feasible();
+    if (problem.has_prize_collection()) {
+      polish_economic_prize_routes(best_adapted.sol);
+      best_adapted.populate_host_data(true);
+    }
+    auto& best_sol = best_adapted.sol;
     return get_ges_assignment(best_sol, solver.injection_info.accepted);
   } else {
     auto best_sol = solver.reserve_population.best().sol;
