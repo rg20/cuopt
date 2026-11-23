@@ -1206,7 +1206,9 @@ struct solve {
         success         = d.recombine(offspring);
         if (success) {
           recombine_stats.add_success();
-          lm.add_selected_unserviced_requests(offspring, d.removed_nodes, weights);
+          if (!p->has_prize_collection()) {
+            lm.add_selected_unserviced_requests(offspring, d.removed_nodes, weights);
+          }
         }
         break;
       }
