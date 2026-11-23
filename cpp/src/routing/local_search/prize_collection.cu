@@ -207,6 +207,180 @@ __global__ void execute_moves(typename solution_t<i_t, f_t, REQUEST>::view_t sol
   original_route.copy_from(sh_route);
 }
 
+// Experimental shared-location complete-request ejection fallback.
+// These candidates use pickup_insertion as grouping mode (0 pickup, 1 delivery),
+// delivery_insertion as the number of ejected requests, and ejected_node_id as
+// the representative pickup. Only the dedicated kernels below interpret them.
+template <typename i_t, typename f_t>
+DI bool shared_location_group_member(
+  const typename solution_t<i_t, f_t, request_t::PDP>::view_t& solution,
+  const NodeInfo<i_t>& info,
+  i_t representative,
+  i_t mode)
+{
+  if (!info.is_service_node()) { return false; }  // retain depots and breaks
+  const auto& orders = solution.problem.order_info;
+  const i_t pickup   = info.is_pickup() ? info.node() : orders.pair_indices[info.node()];
+  const i_t endpoint = mode == 0 ? pickup : orders.pair_indices[pickup];
+  const i_t representative_endpoint =
+    mode == 0 ? representative : orders.pair_indices[representative];
+  return orders.get_order_location(endpoint) == orders.get_order_location(representative_endpoint);
+}
+
+template <typename i_t, typename f_t>
+DI void build_shared_location_group_route(
+  const typename solution_t<i_t, f_t, request_t::PDP>::view_t& solution,
+  const typename route_t<i_t, f_t, request_t::PDP>::view_t& original_route,
+  typename route_t<i_t, f_t, request_t::PDP>::view_t& sh_route,
+  i_t representative,
+  i_t mode)
+{
+  // All endpoints of a request have the same membership predicate. Copy every
+  // retained node, including break nodes and both vehicle-specific depots.
+  if (threadIdx.x == 0) {
+    i_t write = 0;
+    for (i_t read = 0; read <= original_route.get_num_nodes(); ++read) {
+      const auto info = original_route.node_info(read);
+      if (shared_location_group_member<i_t, f_t>(solution, info, representative, mode)) {
+        continue;
+      }
+      sh_route.set_node(write++, original_route.get_node(read));
+    }
+    sh_route.set_num_nodes(write - 1);  // index of the return depot
+    route_t<i_t, f_t, request_t::PDP>::view_t::compute_forward(sh_route);
+    route_t<i_t, f_t, request_t::PDP>::view_t::compute_backward(sh_route);
+    sh_route.compute_cost();
+  }
+  __syncthreads();
+}
+
+template <typename i_t, typename f_t>
+__global__ void find_shared_location_group_ejections(
+  typename solution_t<i_t, f_t, request_t::PDP>::view_t solution,
+  typename move_candidates_t<i_t, f_t>::view_t move_candidates)
+{
+  const i_t request_index = blockIdx.x / 2;
+  const i_t mode          = blockIdx.x % 2;
+  if (request_index >= solution.get_num_requests()) { return; }
+  const i_t representative = solution.get_request(request_index).id();
+  if (!solution.route_node_map.is_node_served(representative)) { return; }
+  const i_t route_id = solution.route_node_map.get_route_id(representative);
+  if (route_id < 0 || route_id >= solution.n_routes) { return; }
+  const auto original_route = solution.routes[route_id];
+
+  __shared__ i_t removed_requests;
+  __shared__ bool eligible;
+  if (threadIdx.x == 0) {
+    i_t total_requests  = 0;
+    i_t first_pickup    = solution.get_num_orders();
+    removed_requests    = 0;
+    bool complete_pairs = true;
+    for (i_t p = 1; p < original_route.get_num_nodes(); ++p) {
+      const auto info = original_route.node_info(p);
+      if (!info.is_service_node()) { continue; }
+      const i_t mate = solution.problem.order_info.pair_indices[info.node()];
+      if (!solution.route_node_map.is_node_served(mate) ||
+          solution.route_node_map.get_route_id(mate) != route_id) {
+        complete_pairs = false;
+        continue;
+      }
+      const i_t mate_pos = solution.route_node_map.get_intra_route_idx(mate);
+      if ((info.is_pickup() && mate_pos <= p) || (!info.is_pickup() && mate_pos >= p)) {
+        complete_pairs = false;
+      }
+      if (!info.is_pickup()) { continue; }
+      ++total_requests;
+      if (shared_location_group_member<i_t, f_t>(solution, info, representative, mode)) {
+        ++removed_requests;
+        first_pickup = min(first_pickup, info.node());
+      }
+    }
+    // Deduplicate each location group by its lowest pickup ID. Preserve at
+    // least one complete request and leave route count unchanged.
+    eligible = complete_pairs && first_pickup == representative && removed_requests >= 2 &&
+               removed_requests < total_requests;
+  }
+  __syncthreads();
+  if (!eligible) { return; }
+
+  extern __shared__ i_t shmem[];
+  auto sh_route = route_t<i_t, f_t, request_t::PDP>::view_t::create_shared_route(
+    shmem, original_route, original_route.get_num_nodes() + 2);
+  __syncthreads();
+  build_shared_location_group_route<i_t, f_t>(
+    solution, original_route, sh_route, representative, mode);
+  if (threadIdx.x == 0 && sh_route.is_feasible()) {
+    const double delta =
+      sh_route.get_cost(move_candidates.include_objective, move_candidates.weights) -
+      original_route.get_cost(move_candidates.include_objective, move_candidates.weights);
+    if (delta > -std::numeric_limits<double>::max() && delta < -EPSILON) {
+      auto& best  = move_candidates.prize_move_candidates.best_cand_per_route;
+      auto& locks = move_candidates.prize_move_candidates.locks_per_route;
+      acquire_lock(&locks[route_id]);
+      const auto current = best[route_id];
+      if (delta < current.cost ||
+          (delta == current.cost &&
+           (representative < current.ejected_node_id ||
+            (representative == current.ejected_node_id && mode < current.pickup_insertion)))) {
+        best[route_id] =
+          prize_cand_t(mode, removed_requests, representative, solution.get_num_orders(), delta);
+      }
+      release_lock(&locks[route_id]);
+    }
+  }
+}
+
+template <typename i_t, typename f_t>
+__global__ void execute_shared_location_group_ejections(
+  typename solution_t<i_t, f_t, request_t::PDP>::view_t solution,
+  typename move_candidates_t<i_t, f_t>::view_t move_candidates)
+{
+  const i_t route_id   = blockIdx.x;
+  const auto candidate = move_candidates.prize_move_candidates.best_cand_per_route[route_id];
+  if (!(candidate.cost > -std::numeric_limits<double>::max() && candidate.cost < -EPSILON)) {
+    return;
+  }
+  const i_t representative = candidate.ejected_node_id;
+  const i_t mode           = candidate.pickup_insertion;
+  if (representative >= solution.get_num_orders() || mode > 1) { return; }
+  auto original_route = solution.routes[route_id];
+  extern __shared__ i_t shmem[];
+  auto sh_route = route_t<i_t, f_t, request_t::PDP>::view_t::create_shared_route(
+    shmem, original_route, original_route.get_num_nodes() + 2);
+  __syncthreads();
+  build_shared_location_group_route<i_t, f_t>(
+    solution, original_route, sh_route, representative, mode);
+
+  __shared__ bool apply;
+  if (threadIdx.x == 0) {
+    const double delta =
+      sh_route.get_cost(move_candidates.include_objective, move_candidates.weights) -
+      original_route.get_cost(move_candidates.include_objective, move_candidates.weights);
+    apply = sh_route.get_num_service_nodes() >= 2 && sh_route.is_feasible() &&
+            delta > -std::numeric_limits<double>::max() && delta < -EPSILON;
+    cuopt_assert(abs(delta - candidate.cost) < EPSILON,
+                 "Group-ejection candidate cost changed before execution");
+  }
+  __syncthreads();
+  if (!apply) { return; }
+
+  // One winning group per route; different routes own disjoint served tasks.
+  for (i_t p = threadIdx.x + 1; p < original_route.get_num_nodes(); p += blockDim.x) {
+    const auto info = original_route.node_info(p);
+    if (shared_location_group_member<i_t, f_t>(solution, info, representative, mode)) {
+      solution.route_node_map.reset_node(info.node());
+    }
+  }
+  __syncthreads();
+  sh_route.compute_intra_indices(solution.route_node_map);
+  __syncthreads();
+  original_route.copy_from(sh_route);
+  if (threadIdx.x == 0) {
+    solution.routes_to_copy[route_id]   = 1;
+    solution.routes_to_search[route_id] = 1;
+  }
+}
+
 template <typename i_t, typename f_t, request_t REQUEST>
 bool local_search_t<i_t, f_t, REQUEST>::perform_prize_collection(solution_t<i_t, f_t, REQUEST>& sol)
 {
@@ -232,7 +406,34 @@ bool local_search_t<i_t, f_t, REQUEST>::perform_prize_collection(solution_t<i_t,
                                                                          move_candidates.view());
   RAFT_CHECK_CUDA(sol.sol_handle->get_stream().get());
 
-  if (!move_candidates.prize_move_candidates.has_improving_routes(sol.sol_handle)) { return false; }
+  if (!move_candidates.prize_move_candidates.has_improving_routes(sol.sol_handle)) {
+    if constexpr (REQUEST == request_t::PDP) {
+      if (sol.get_n_routes() == 0 || sol.get_num_requests() == 0) { return false; }
+      move_candidates.prize_move_candidates.reset(sol.sol_handle);
+      // Reuse the established shared-route allocation bound from single PDP
+      // moves. Group ejection only shrinks routes; it cannot activate a vehicle.
+      shared_size = sol.check_routes_can_insert_and_get_sh_size(2);
+      if (!set_shmem_of_kernel(find_shared_location_group_ejections<i_t, f_t>, shared_size) ||
+          !set_shmem_of_kernel(execute_shared_location_group_ejections<i_t, f_t>, shared_size)) {
+        return false;
+      }
+      find_shared_location_group_ejections<i_t, f_t>
+        <<<2 * sol.get_num_requests(), TPB, shared_size, sol.sol_handle->get_stream().get()>>>(
+          sol.view(), move_candidates.view());
+      RAFT_CHECK_CUDA(sol.sol_handle->get_stream().get());
+      if (!move_candidates.prize_move_candidates.has_improving_routes(sol.sol_handle)) {
+        return false;
+      }
+      execute_shared_location_group_ejections<i_t, f_t>
+        <<<sol.get_n_routes(), TPB, shared_size, sol.sol_handle->get_stream().get()>>>(
+          sol.view(), move_candidates.view());
+      RAFT_CHECK_CUDA(sol.sol_handle->get_stream().get());
+      sol.compute_cost();
+      sol.global_runtime_checks(false, false, "perform_prize_collection_group_end");
+      return true;
+    }
+    return false;
+  }
 
   n_blocks    = sol.get_n_routes();
   shared_size = sol.check_routes_can_insert_and_get_sh_size(request_info_t<i_t, REQUEST>::size());
