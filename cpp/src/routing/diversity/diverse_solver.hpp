@@ -31,7 +31,7 @@
 
 namespace cuopt::routing {
 
-enum class recombiner_t : int { SREX, OX, EAX, AEAX, IX, DISPOSE, SIZE };
+enum class recombiner_t : int { SREX, OX, EAX, AEAX, IX, DISPOSE, ROUTE_OPEN, SIZE };
 
 constexpr int max_sol_per_population          = 32;
 constexpr int default_reserve_population_size = 32;
@@ -95,7 +95,8 @@ struct recombine_stats {
 
 struct all_recombine_stats {
   static constexpr size_t recombiner_count      = static_cast<int>(recombiner_t::SIZE);
-  static constexpr std::array recombiner_labels = {"SREX", "OX", "EAX", "AEAX", "IX", "DISPOSE"};
+  static constexpr std::array recombiner_labels = {
+    "SREX", "OX", "EAX", "AEAX", "IX", "DISPOSE", "ROUTE_OPEN"};
 
   std::array<recombine_stats, recombiner_count> stats;
 
@@ -1094,6 +1095,29 @@ struct solve {
     fflush(f.file_ptr);
   }
 
+  std::vector<detail::NodeInfo<>> route_open_pickups(const solution& sol) const
+  {
+    std::vector<detail::NodeInfo<>> pickups;
+    if constexpr (solution::request_type != request_t::PDP) { return pickups; }
+    if (!p->has_prize_collection() || !sol.has_unserviced_nodes) { return pickups; }
+    bool available = sol.routes.size() < static_cast<size_t>(p->get_fleet_size());
+    for (const auto& route : sol.routes) {
+      available |= route.is_empty();
+    }
+    if (!available) { return pickups; }
+    for (const auto& node : sol.nodes) {
+      const auto pickup = node.node_info;
+      if (!pickup.is_service_node() || !pickup.is_pickup() || !sol.unserviced(pickup.node())) {
+        continue;
+      }
+      const auto delivery = p->get_brother_node_info(pickup);
+      if (delivery.is_service_node() && delivery.is_delivery() && sol.unserviced(delivery.node())) {
+        pickups.push_back(pickup);
+      }
+    }
+    return pickups;
+  }
+
   /*! \brief { Recombining two solutions choosing between EAX and SREX at
    * probablity 1/2 (a learning policy could be applied here). }*/
   bool recombine(solution& a,
@@ -1129,6 +1153,11 @@ struct solve {
       }
       if (recombine_options.size() == 0) { return false; }
     }
+    const auto open_pickups_a = route_open_pickups(a);
+    const auto open_pickups_b = route_open_pickups(b);
+    if (!open_pickups_a.empty() || !open_pickups_b.empty()) {
+      recombine_options.insert(recombiner_t::ROUTE_OPEN);
+    }
     std::uniform_int_distribution<int> dist(0, recombine_options.size() - 1);
 
     const auto& dimensions_info = a.problem->dimensions_info;
@@ -1140,6 +1169,37 @@ struct solve {
     recombine_stats.add_attempt(recombiner);
 
     switch (recombiner) {
+      case recombiner_t::ROUTE_OPEN: {
+        guiding = open_pickups_a.empty() ||
+                  (!open_pickups_b.empty() && std::uniform_int_distribution<int>(0, 1)(rng));
+        auto& offspring         = guiding ? b : a;
+        const auto& pickups     = guiding ? open_pickups_b : open_pickups_a;
+        auto available_vehicles = offspring.sol.get_unused_vehicles();
+        for (const auto& route : offspring.routes) {
+          if (route.is_empty()) { available_vehicles.push_back(route.vehicle_id); }
+        }
+        if (pickups.empty() || available_vehicles.empty()) { break; }
+        const auto vehicle_id = available_vehicles[std::uniform_int_distribution<size_t>(
+          0, available_vehicles.size() - 1)(rng)];
+        const auto pickup =
+          pickups[std::uniform_int_distribution<size_t>(0, pickups.size() - 1)(rng)];
+        const auto delivery = p->get_brother_node_info(pickup);
+        // Reuse an allocated empty route's vehicle if one was selected.
+        for (size_t i = 0; i < offspring.routes.size(); ++i) {
+          if (offspring.routes[i].vehicle_id == vehicle_id) {
+            cuopt_assert(offspring.routes[i].is_empty(), "Seed vehicle must be unused");
+            offspring.remove_routes({static_cast<typename solution::i_type>(i)});
+            break;
+          }
+        }
+        // Allow the activation cost to be recovered by subsequent prize insertions.
+        offspring.add_new_routes({{vehicle_id, {pickup, delivery}}});
+        offspring.set_routes_to_search();
+        success = true;
+        recombine_stats.add_success();
+        break;
+      }
+
       case recombiner_t::DISPOSE: {
         guiding         = next_random() % 2;
         auto& offspring = guiding ? b : a;
