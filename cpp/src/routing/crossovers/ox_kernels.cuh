@@ -197,9 +197,11 @@ __global__ void calculate_edge_costs_kernel(
         helper_nodes[b], helper_nodes[2], vehicle_info, true, weights, d_zero_cost, d_zero_cost);
 
       // cost includes vehicle_info.fixed_cost via vehicle_fixed_cost_node_t::get_cost
-      row_value[row_n_edges] = cost;
-      row_edge[row_n_edges]  = j;
-      ++row_n_edges;
+      if (j - i >= request_info_t<i_t, REQUEST>::size()) {
+        row_value[row_n_edges] = cost;
+        row_edge[row_n_edges]  = j;
+        ++row_n_edges;
+      }
 
       if (j + 1 == offspring.size()) { break; }
 

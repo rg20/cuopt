@@ -926,7 +926,9 @@ struct OX {
                                                                           objective_cost_t{},
                                                                           infeasible_cost_t{});
           // cost includes vehicle_info.fixed_cost via vehicle_fixed_cost_node_t::get_cost
-          graph[i].emplace_back(j, cost, veh);
+          if (j - i >= (size_t)request_info_t<int, Solution::request_type>::size()) {
+            graph[i].emplace_back(j, cost, veh);
+          }
           if (j + 1 == offspring.size()) break;
 
           HelperNodes[!b] =
